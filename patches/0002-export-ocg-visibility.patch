@@ -73,7 +73,10 @@ diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
 +namespace {
 +
 +RetainPtr<const CPDF_Array> GetOCGArray(CPDF_Document* doc) {
-+  RetainPtr<const CPDF_Dictionary> root = doc->GetRoot();
++  // CPDF_Document::GetRoot returns a raw pointer (not RetainPtr) — the
++  // dictionary is owned by the document and lives as long as it does, so
++  // we just borrow it for the immediate lookups below.
++  const CPDF_Dictionary* root = doc->GetRoot();
 +  if (!root) {
 +    return nullptr;
 +  }

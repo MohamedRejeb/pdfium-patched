@@ -26,12 +26,18 @@ if [ ! -d "$PDFIUM_DIR" ]; then
 fi
 
 OUT_DIR="$PDFIUM_DIR/out/$TARGET"
+# Nuke any cached out/ dir from a previous build — keeps the source-tree
+# cache fast (gclient sync skipped on cache hit) without inheriting stale
+# build.ninja / .o / dylib artifacts from a build that ran without our
+# current patches. Without this, ninja can re-link a cached dylib that
+# silently lacks symbols introduced by patches added in this run.
+rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 cp "$ARGS_FILE" "$OUT_DIR/args.gn"
 
 cd "$PDFIUM_DIR"
 
-echo ">>> gn gen out/$TARGET"
+echo ">>> gn gen out/$TARGET (clean)"
 gn gen "out/$TARGET"
 
 echo "OK: configured $TARGET → $OUT_DIR"

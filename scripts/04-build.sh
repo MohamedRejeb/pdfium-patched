@@ -118,6 +118,22 @@ if [ -n "$DECL_SYMS" ]; then
         if ! { nm -gU "$LIB_PATH" 2>/dev/null | grep -q " _\?${sym}$"; } \
            && ! { nm -D  "$LIB_PATH" 2>/dev/null | grep -q " ${sym}$"; }; then
           echo "FAIL: declared symbol $sym not exported by $LIB_PATH" >&2
+          # Dump diagnostics so the next CI failure tells us what's actually
+          # in the dylib without needing another roundtrip.
+          echo "--- diagnostic: $LIB_PATH ($(stat -f '%z' "$LIB_PATH" 2>/dev/null || stat -c '%s' "$LIB_PATH" 2>/dev/null) bytes) ---" >&2
+          echo "--- any FPDF-prefixed exports (first 20 of nm -gU): ---" >&2
+          nm -gU "$LIB_PATH" 2>/dev/null | grep -E '_?FPDF' | head -20 >&2 || true
+          echo "--- any FPDFRejeb_-prefixed exports (nm -gU): ---" >&2
+          nm -gU "$LIB_PATH" 2>/dev/null | grep -E '_?FPDFRejeb' >&2 || echo "(none)" >&2
+          echo "--- looking for fpdf_rejeb.o in build out: ---" >&2
+          find "$OUT_DIR/obj" -name 'fpdf_rejeb.o' 2>/dev/null | head -3 >&2 || true
+          OBJ_FILE="$(find "$OUT_DIR/obj" -name 'fpdf_rejeb.o' 2>/dev/null | head -1)"
+          if [ -n "$OBJ_FILE" ]; then
+            echo "--- nm of $OBJ_FILE (FPDFRejeb): ---" >&2
+            nm "$OBJ_FILE" 2>/dev/null | grep -E '_?FPDFRejeb' >&2 || echo "(none)" >&2
+          else
+            echo "--- fpdf_rejeb.o NOT FOUND in build output — patch did not add the source ---" >&2
+          fi
           exit 1
         fi
         ;;

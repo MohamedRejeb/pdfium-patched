@@ -1,6 +1,6 @@
 # Claude Code working files (never tracked)
 CLAUDE.md
-.claude/settings.local.json
+.claude/
 
 # Plans are local-only; never push planning docs
 plans/

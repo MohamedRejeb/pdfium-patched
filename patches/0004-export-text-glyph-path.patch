@@ -1,0 +1,109 @@
+# Feature patch 0004 — export FPDFRejeb_TextGetGlyphPath, an indexed
+# glyph-path accessor that takes the source charcode from the text page
+# instead of going through the unicode mapping.
+#
+# Annodoc M1.2 follow-up. Upstream FPDFFont_GetGlyphPath does:
+#
+#   uint32_t charcode = pFont->CharCodeFromUnicode(static_cast<wchar_t>(glyph));
+#
+# That round-trip is lossy for many CID fonts (notably Arabic embedded
+# subsets) — every charcode collapses to .notdef, producing the same
+# 12-segment fallback path for every glyph in the document.
+#
+# This patch skips the unicode hop and feeds the SOURCE charcode straight
+# into CPDF_Font::GetCharPosList → CFX_Font::LoadGlyphPath, which is the
+# same chain PDFium's internal text rasterizer uses. Per-char accessor
+# (text_page + char_index) so the caller doesn't have to find the right
+# CPDF_TextObject themselves.
+#
+# Returns NULL for: null text_page, out-of-range / negative char_index,
+# generated chars (kGenerated — inserted spaces / hyphens / line-break
+# artifacts), null text object, null font, Type 3 fonts (those define
+# glyphs as content streams, not outlines), and empty char-pos lookup.
+#
+# Returned FPDF_GLYPHPATH is consumed by upstream
+# FPDFGlyphPath_CountGlyphSegments / FPDFGlyphPath_GetGlyphPathSegment.
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index d416bbb..1358884 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -2,8 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <vector>
++
+ #include "public/fpdf_rejeb.h"
+ 
++#include "core/fpdfapi/font/cpdf_font.h"
+ #include "core/fpdfapi/page/cpdf_occontext.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
+@@ -13,6 +16,8 @@
+ #include "core/fpdftext/cpdf_textpage.h"
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/retain_ptr.h"
++#include "core/fxge/cfx_font.h"
++#include "core/fxge/text_char_pos.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+ 
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+@@ -145,3 +150,58 @@ FPDFRejeb_TextGetSourceCharCode(FPDF_TEXTPAGE text_page, int char_index) {
+   // simple fonts).
+   return tp->GetCharInfo(static_cast<size_t>(char_index)).char_code();
+ }
++
++FPDF_EXPORT FPDF_GLYPHPATH FPDF_CALLCONV
++FPDFRejeb_TextGetGlyphPath(FPDF_TEXTPAGE text_page,
++                           int char_index,
++                           float font_size) {
++  if (!text_page || char_index < 0) {
++    return nullptr;
++  }
++  CPDF_TextPage* tp = CPDFTextPageFromFPDFTextPage(text_page);
++  if (!tp || static_cast<size_t>(char_index) >= tp->size()) {
++    return nullptr;
++  }
++  const CPDF_TextPage::CharInfo& info =
++      tp->GetCharInfo(static_cast<size_t>(char_index));
++  // Generated chars (inserted spaces, hyphens, line-break artifacts) have
++  // no real source glyph — caller can't rasterize them.
++  if (info.char_type() == CPDF_TextPage::CharType::kGenerated) {
++    return nullptr;
++  }
++  const CPDF_TextObject* text_obj = info.text_object();
++  if (!text_obj) {
++    return nullptr;
++  }
++  RetainPtr<CPDF_Font> font = text_obj->GetFont();
++  // Type 3 fonts define glyphs as content streams, not as outlines —
++  // LoadGlyphPath has nothing to return.
++  if (!font || font->IsType3Font()) {
++    return nullptr;
++  }
++  // Mirror upstream FPDFFont_GetGlyphPath but feed the SOURCE charcode
++  // straight in. Upstream calls CharCodeFromUnicode(glyph) first, which
++  // round-trips through the unicode mapping — that mapping is lossy or
++  // missing for many CID fonts (notably Arabic subsets), so every char
++  // collapses to .notdef. Skipping that step preserves the actual glyph.
++  uint32_t charcode = info.char_code();
++  static constexpr float kCharCodePosition = 0;
++  std::vector<TextCharPos> pos = font->GetCharPosList(
++      pdfium::span_from_ref(charcode),
++      pdfium::span_from_ref(kCharCodePosition), font_size);
++  if (pos.empty()) {
++    return nullptr;
++  }
++  CFX_Font* cfx_font;
++  if (pos[0].fallback_font_position_ == -1) {
++    cfx_font = font->GetFont();
++  } else {
++    cfx_font = font->GetFontFallback(pos[0].fallback_font_position_);
++    if (!cfx_font) {
++      return nullptr;
++    }
++  }
++  const CFX_Path* path =
++      cfx_font->LoadGlyphPath(pos[0].glyph_index_, pos[0].font_char_width_);
++  return reinterpret_cast<FPDF_GLYPHPATH>(path);
++}

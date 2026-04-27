@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 
+#include "fpdf_edit.h"  // for FPDF_GLYPHPATH (used by FPDFRejeb_TextGetGlyphPath)
 #include "fpdfview.h"
 
 // Opaque handle for an Optional Content (layer) visibility context bound
@@ -106,6 +107,28 @@ FPDFRejeb_GetOCGName(FPDF_DOCUMENT document,
 // core/fpdftext/cpdf_textpage.h.
 FPDF_EXPORT uint32_t FPDF_CALLCONV
 FPDFRejeb_TextGetSourceCharCode(FPDF_TEXTPAGE text_page, int char_index);
+
+// Returns the glyph outline (FPDF_GLYPHPATH) for the char at |char_index|
+// of |text_page| at |font_size|, using the source-stream charcode directly
+// — sidesteps upstream FPDFFont_GetGlyphPath's CharCodeFromUnicode round
+// trip, which collapses to .notdef for many CID fonts (notably Arabic
+// embedded subsets).
+//
+// The returned handle is consumed by upstream FPDFGlyphPath_CountGlyphSegments
+// / FPDFGlyphPath_GetGlyphPathSegment exactly the same way as a path from
+// FPDFFont_GetGlyphPath. The handle's lifetime is tied to the underlying
+// font; do NOT use it after the document is closed.
+//
+// Returns NULL for null/out-of-range inputs, generated chars (kGenerated
+// — inserted spaces, hyphens, line-break artifacts), Type 3 fonts (whose
+// glyphs are content streams, not outlines), and char-pos lookup miss.
+//
+// Backed by patches/0004-export-text-glyph-path.patch wrapping
+// CPDF_Font::GetCharPosList + CFX_Font::LoadGlyphPath.
+FPDF_EXPORT FPDF_GLYPHPATH FPDF_CALLCONV
+FPDFRejeb_TextGetGlyphPath(FPDF_TEXTPAGE text_page,
+                           int char_index,
+                           float font_size);
 
 #ifdef __cplusplus
 }  // extern "C"

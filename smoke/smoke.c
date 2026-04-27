@@ -41,6 +41,7 @@ int main(void) {
   }
   {
     (void)FPDFRejeb_TextGetSourceCharCode(NULL, 0);
+    (void)FPDFRejeb_TextGetGlyphPath(NULL, 0, 0.0f);
   }
 
   FPDF_DestroyLibrary();

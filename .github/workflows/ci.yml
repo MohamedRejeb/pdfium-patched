@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A single in-flight CI run per ref; new pushes cancel older runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: mac-arm64
+          - os: macos-15
+            target: mac-x64
+          - os: ubuntu-22.04
+            target: linux-x64
+          - os: windows-2022
+            target: win-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      DEPOT_TOOLS_UPDATE: "1"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 git curl pkg-config libfontconfig1-dev zip
+
+      - name: Select Xcode (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # PDFium chromium/7811 needs the SDK module layout shipped with Xcode 26.
+          # Default macos-15 Xcode (16.4) ships SDKs whose DarwinFoundation1 /
+          # DarwinBasic modulemaps live under different paths than libc++ expects,
+          # breaking the libc++ module precompile. bblanchon hits the same and
+          # selects Xcode_26.0 — we mirror that.
+          if [ -d "/Applications/Xcode_26.0.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_26.0.app"
+          else
+            echo "::warning::Xcode_26.0.app not on this runner; available Xcodes:"
+            ls /Applications/ | grep -i xcode || true
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Setup MSVC env
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install depot_tools (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          # Force depot_tools to bootstrap its bundled python / gn helper files now,
+          # so that gn/ninja invoked later don't fail with python3_bin_reldir.txt missing.
+          export PATH="$HOME/depot_tools:$PATH"
+          gclient --version
+
+      - name: Install depot_tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmp = "$env:RUNNER_TEMP\depot_tools.zip"
+          $dest = "$env:USERPROFILE\depot_tools"
+          Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-infra/depot_tools.zip" -OutFile $tmp
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Force -Path $tmp -DestinationPath $dest
+          Add-Content -Path $env:GITHUB_PATH -Value $dest
+          # Trigger first-use bootstrap (downloads bundled python, gn, ninja, cipd client).
+          $env:PATH = "$dest;$env:PATH"
+          & "$dest\gclient.bat" --version
+
+      - name: Cache pdfium/ source
+        id: cache-pdfium
+        uses: actions/cache@v4
+        with:
+          path: pdfium
+          key: pdfium-${{ matrix.target }}-${{ hashFiles('PDFIUM_VERSION') }}
+
+      - name: Fetch PDFium
+        shell: bash
+        run: ./scripts/01-fetch-pdfium.sh
+
+      - name: Apply patches
+        shell: bash
+        run: ./scripts/02-apply-patches.sh
+
+      - name: Configure
+        shell: bash
+        run: ./scripts/03-configure.sh ${{ matrix.target }}
+
+      - name: Build + package
+        shell: bash
+        run: ./scripts/04-build.sh ${{ matrix.target }}
+
+      - name: Runtime smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cl /nologo /I dist\win-x64\include smoke\smoke.c /link /LIBPATH:dist\win-x64\lib pdfium.dll.lib /OUT:smoke.exe
+          copy /Y dist\win-x64\bin\pdfium.dll .
+          smoke.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpdfium-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          retention-days: 14
+          if-no-files-found: error

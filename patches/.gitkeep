@@ -1,0 +1,3 @@
+# Feature patches go here — one .patch per FPDFRejeb_* concept.
+# See ../README.md and ../CLAUDE.md for authoring guidelines.
+# Empty for M0 (pristine PDFium, no feature patches).

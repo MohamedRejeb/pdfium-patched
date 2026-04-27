@@ -1,0 +1,20 @@
+infra/ — build infrastructure patches
+======================================
+
+These patches are applied to PDFium on every build, before any feature
+patches in patches/. They are *not* counted in PATCHES_VERSION because
+they don't add any FPDFRejeb_* features — they only fix the build
+output to match what downstream consumers expect:
+
+  * 0001-shared-library.patch — make `pdfium` a shared_library target
+    so ninja produces libpdfium.{dylib|so|dll} instead of a static .a.
+  * 0002-public-headers.patch — flatten public/cpp include paths and
+    always-define FPDF_EXPORT so consumers can link without needing
+    COMPONENT_BUILD.
+
+Both patches are vendored verbatim (with minor trim of unused Windows
+metadata) from bblanchon/pdfium-binaries, BSD-3-Clause licensed.
+Re-vendor when bumping PDFIUM_VERSION if upstream PDFium drifts in the
+patched files (BUILD.gn, public/fpdfview.h, public/cpp/fpdf_*.h).
+
+Source: https://github.com/bblanchon/pdfium-binaries/tree/master/patches

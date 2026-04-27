@@ -1,0 +1,19 @@
+# Claude Code working files (never tracked)
+CLAUDE.md
+.claude/settings.local.json
+
+# Plans are local-only; never push planning docs
+plans/
+
+# Build outputs
+dist/
+pdfium/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp

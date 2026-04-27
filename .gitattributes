@@ -1,0 +1,8 @@
+# Force LF line endings for files that must not be touched by git's
+# autocrlf on Windows checkouts. `git apply` rejects patches whose
+# line endings don't match the working tree, so patches and shell
+# scripts must stay LF on every platform.
+*.patch    text eol=lf
+*.sh       text eol=lf
+*.gn       text eol=lf
+*.args.gn  text eol=lf

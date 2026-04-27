@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  validate-tag:
+    name: validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert tag matches PDFIUM_VERSION + PATCHES_VERSION
+        run: |
+          set -euo pipefail
+          PDFIUM_VER="$(cat PDFIUM_VERSION | tr -d '[:space:]' | sed 's|chromium/||')"
+          PATCHES_VER="$(cat PATCHES_VERSION | tr -d '[:space:]')"
+          EXPECTED="v${PDFIUM_VER}+rejeb.${PATCHES_VER}"
+          REF_NAME="${GITHUB_REF_NAME}"
+          if [ "$REF_NAME" != "$EXPECTED" ]; then
+            echo "::error::tag $REF_NAME does not match expected $EXPECTED (PDFIUM_VERSION=$(cat PDFIUM_VERSION), PATCHES_VERSION=$(cat PATCHES_VERSION))"
+            exit 1
+          fi
+          echo "tag $REF_NAME matches expected $EXPECTED"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: mac-arm64
+          - os: macos-15
+            target: mac-x64
+          - os: ubuntu-22.04
+            target: linux-x64
+          - os: windows-2022
+            target: win-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      DEPOT_TOOLS_UPDATE: "1"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 git curl pkg-config libfontconfig1-dev zip
+
+      - name: Select Xcode (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # See ci.yml for context — match bblanchon's Xcode_26.0 selection.
+          if [ -d "/Applications/Xcode_26.0.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_26.0.app"
+          else
+            echo "::warning::Xcode_26.0.app not on this runner; available Xcodes:"
+            ls /Applications/ | grep -i xcode || true
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Setup MSVC env
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install depot_tools (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          export PATH="$HOME/depot_tools:$PATH"
+          gclient --version
+
+      - name: Install depot_tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmp = "$env:RUNNER_TEMP\depot_tools.zip"
+          $dest = "$env:USERPROFILE\depot_tools"
+          Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-infra/depot_tools.zip" -OutFile $tmp
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Force -Path $tmp -DestinationPath $dest
+          Add-Content -Path $env:GITHUB_PATH -Value $dest
+          $env:PATH = "$dest;$env:PATH"
+          & "$dest\gclient.bat" --version
+
+      - name: Fetch PDFium
+        shell: bash
+        run: ./scripts/01-fetch-pdfium.sh
+
+      - name: Apply patches
+        shell: bash
+        run: ./scripts/02-apply-patches.sh
+
+      - name: Configure
+        shell: bash
+        run: ./scripts/03-configure.sh ${{ matrix.target }}
+
+      - name: Build + package
+        shell: bash
+        run: ./scripts/04-build.sh ${{ matrix.target }}
+
+      - name: Runtime smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cl /nologo /I dist\win-x64\include smoke\smoke.c /link /LIBPATH:dist\win-x64\lib pdfium.dll.lib /OUT:smoke.exe
+          copy /Y dist\win-x64\bin\pdfium.dll .
+          smoke.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Repack into per-target zips
+        run: |
+          set -euo pipefail
+          mkdir -p release-zips
+          for target in mac-arm64 mac-x64 linux-x64 win-x64; do
+            src="artifacts/dist-$target"
+            if [ ! -d "$src" ]; then
+              echo "::error::missing artifact for $target"
+              exit 1
+            fi
+            zip_name="libpdfium-${target}-${GITHUB_REF_NAME}.zip"
+            (cd "$src" && zip -r "$GITHUB_WORKSPACE/release-zips/$zip_name" .)
+          done
+          ls -la release-zips/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            release-zips/*.zip

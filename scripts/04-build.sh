@@ -87,9 +87,15 @@ fi
 # convention) and ELF (`<sym>`), and is whitespace-agnostic (the macos-15
 # runner's LLVM nm tab-separates fields where local LLVM nm space-separates
 # — awk's default FS handles both).
+#
+# Combines `nm -gU` (defined globals from `.symtab`) with `nm -gD` (defined
+# globals from `.dynsym`). Linux release .so files are stripped, so `.symtab`
+# is empty and only `.dynsym` carries the exports; Mach-O dylibs lack a
+# `.dynsym` entirely and `nm -D` errors out. Either format will surface the
+# symbol on its respective platform.
 sym_exported() {
   local lib="$1" sym="$2"
-  nm -gU "$lib" 2>/dev/null | awk -v s="$sym" '
+  { nm -gU "$lib" 2>/dev/null; nm -gD "$lib" 2>/dev/null; } | awk -v s="$sym" '
     $NF == s || $NF == "_" s { f=1 }
     END { exit !f }
   '

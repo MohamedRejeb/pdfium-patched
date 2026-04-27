@@ -30,6 +30,15 @@ int main(void) {
     unsigned long out_size = 0;
     (void)FPDFRejeb_TextObjGetCharCodes(NULL, NULL, 0, &out_size);
   }
+  {
+    FPDF_OCCONTEXT ctx = FPDFRejeb_OCContextCreate(NULL);
+    (void)FPDFRejeb_OCContextCheckObjectVisible(ctx, NULL);
+    FPDFRejeb_OCContextDestroy(ctx);
+  }
+  {
+    (void)FPDFRejeb_GetOCGCount(NULL);
+    (void)FPDFRejeb_GetOCGName(NULL, 0, NULL, 0);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

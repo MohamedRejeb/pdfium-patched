@@ -18,6 +18,15 @@
 
 #include "fpdfview.h"
 
+// Opaque handle for an Optional Content (layer) visibility context bound
+// to a document. Created by FPDFRejeb_OCContextCreate, destroyed by
+// FPDFRejeb_OCContextDestroy. Must NOT outlive the underlying FPDF_DOCUMENT.
+//
+// Modeled on upstream FPDF_* opaque-pointer typedefs (e.g. FPDF_DOCUMENT)
+// to keep the type system honest: a caller cannot pass an FPDF_DOCUMENT
+// where an FPDF_OCCONTEXT is expected.
+typedef struct fpdf_occontext_t__* FPDF_OCCONTEXT;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +47,45 @@ FPDFRejeb_TextObjGetCharCodes(FPDF_PAGEOBJECT text_object,
                               uint32_t* buffer,
                               unsigned long buffer_size,
                               unsigned long* out_size);
+
+// Creates an Optional Content (layer) visibility context for |document|,
+// configured for kView usage. Returns an opaque handle owned by the caller —
+// must be released via FPDFRejeb_OCContextDestroy. Returns NULL on error
+// (e.g. null document).
+//
+// Backed by patches/0002-export-ocg-visibility.patch wrapping
+// CPDF_OCContext in core/fpdfapi/page/cpdf_occontext.h.
+FPDF_EXPORT FPDF_OCCONTEXT FPDF_CALLCONV
+FPDFRejeb_OCContextCreate(FPDF_DOCUMENT document);
+
+// Releases the OC context returned by FPDFRejeb_OCContextCreate. Safe to
+// call with NULL. After this returns the handle is invalid.
+FPDF_EXPORT void FPDF_CALLCONV
+FPDFRejeb_OCContextDestroy(FPDF_OCCONTEXT context);
+
+// Returns true if |page_object| is currently visible under the OC layer
+// state captured by |context|. Returns false on null args or when the
+// object is hidden by the active layer state.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_OCContextCheckObjectVisible(FPDF_OCCONTEXT context,
+                                      FPDF_PAGEOBJECT page_object);
+
+// Returns the number of Optional Content Groups (layers) declared in
+// |document|'s OCProperties dictionary. Returns -1 on null document, 0
+// if the document declares no OCGs.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_GetOCGCount(FPDF_DOCUMENT document);
+
+// Writes the UTF-16LE name of OCG |index| into |buffer| using the standard
+// PDFium two-pass query pattern: pass NULL buffer + 0 buflen first to learn
+// the byte length, then allocate and call again. Returns the number of
+// bytes written (or required) including the NUL terminator. Returns 0 on
+// null/invalid arguments or out-of-range |index|.
+FPDF_EXPORT unsigned long FPDF_CALLCONV
+FPDFRejeb_GetOCGName(FPDF_DOCUMENT document,
+                     int index,
+                     void* buffer,
+                     unsigned long buflen);
 
 #ifdef __cplusplus
 }  // extern "C"

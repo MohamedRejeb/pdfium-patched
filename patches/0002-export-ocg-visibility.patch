@@ -1,0 +1,127 @@
+# Feature patch 0002 — export Optional Content Group (OC) visibility helpers
+# as FPDFRejeb_OCContext* and FPDFRejeb_GetOCG* functions.
+#
+# Wraps PDFium's CPDF_OCContext (in core/fpdfapi/page/cpdf_occontext.h)
+# so downstream consumers can ask "is this page object visible under the
+# document's current OC layer state?" without reaching into PDFium internals.
+# Also surfaces the document's OCG array (count + name lookup by index)
+# so a UI can present a layer-toggle list.
+#
+# Lifecycle: FPDFRejeb_OCContextCreate returns an opaque handle that owns
+# a heap-boxed RetainPtr<CPDF_OCContext>. The caller MUST pair every
+# successful create with FPDFRejeb_OCContextDestroy, otherwise the
+# refcount on the underlying CPDF_OCContext leaks.
+#
+# Note: CPDF_OCContext::CheckPageObjectVisible is the actual upstream
+# entry point — the visibility check itself walks the page object's
+# /OC dictionary against the kView usage state baked in at construction.
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -4,8 +4,14 @@
+
+ #include "public/fpdf_rejeb.h"
+
++#include "core/fpdfapi/page/cpdf_occontext.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
++#include "core/fpdfapi/parser/cpdf_array.h"
++#include "core/fpdfapi/parser/cpdf_dictionary.h"
++#include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fxcrt/compiler_specific.h"
++#include "core/fxcrt/retain_ptr.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+
+ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+@@ -30,3 +36,90 @@
+   }
+   return true;
+ }
++
++FPDF_EXPORT FPDF_OCCONTEXT FPDF_CALLCONV
++FPDFRejeb_OCContextCreate(FPDF_DOCUMENT document) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return nullptr;
++  }
++  // Box the RetainPtr on the heap so we can hand a stable opaque pointer to C.
++  // Destroyed by FPDFRejeb_OCContextDestroy.
++  auto* boxed = new RetainPtr<CPDF_OCContext>(
++      pdfium::MakeRetain<CPDF_OCContext>(doc, CPDF_OCContext::kView));
++  return reinterpret_cast<FPDF_OCCONTEXT>(boxed);
++}
++
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFRejeb_OCContextDestroy(FPDF_OCCONTEXT context) {
++  delete reinterpret_cast<RetainPtr<CPDF_OCContext>*>(context);
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_OCContextCheckObjectVisible(FPDF_OCCONTEXT context,
++                                      FPDF_PAGEOBJECT page_object) {
++  if (!context || !page_object) {
++    return false;
++  }
++  auto* boxed = reinterpret_cast<RetainPtr<CPDF_OCContext>*>(context);
++  CPDF_PageObject* page_obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!page_obj) {
++    return false;
++  }
++  return (*boxed)->CheckPageObjectVisible(page_obj);
++}
++
++namespace {
++
++RetainPtr<const CPDF_Array> GetOCGArray(CPDF_Document* doc) {
++  RetainPtr<const CPDF_Dictionary> root = doc->GetRoot();
++  if (!root) {
++    return nullptr;
++  }
++  RetainPtr<const CPDF_Dictionary> ocp = root->GetDictFor("OCProperties");
++  if (!ocp) {
++    return nullptr;
++  }
++  return ocp->GetArrayFor("OCGs");
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_GetOCGCount(FPDF_DOCUMENT document) {
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return -1;
++  }
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(doc);
++  if (!ocgs) {
++    return 0;
++  }
++  return static_cast<int>(ocgs->size());
++}
++
++FPDF_EXPORT unsigned long FPDF_CALLCONV
++FPDFRejeb_GetOCGName(FPDF_DOCUMENT document,
++                     int index,
++                     void* buffer,
++                     unsigned long buflen) {
++  if (index < 0) {
++    return 0;
++  }
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return 0;
++  }
++  RetainPtr<const CPDF_Array> ocgs = GetOCGArray(doc);
++  if (!ocgs || static_cast<size_t>(index) >= ocgs->size()) {
++    return 0;
++  }
++  RetainPtr<const CPDF_Dictionary> ocg =
++      ocgs->GetDictAt(static_cast<size_t>(index));
++  if (!ocg) {
++    return 0;
++  }
++  // SAFETY: required from caller.
++  return Utf16EncodeMaybeCopyAndReturnLength(
++      ocg->GetUnicodeTextFor("Name"),
++      UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
++}

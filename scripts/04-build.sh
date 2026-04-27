@@ -95,10 +95,14 @@ fi
 # symbol on its respective platform.
 sym_exported() {
   local lib="$1" sym="$2"
-  { nm -gU "$lib" 2>/dev/null; nm -gD "$lib" 2>/dev/null; } | awk -v s="$sym" '
-    $NF == s || $NF == "_" s { f=1 }
-    END { exit !f }
-  '
+  # `|| true` keeps each nm invocation from poisoning the pipeline under
+  # `set -o pipefail`: nm -gD exits non-zero on Mach-O ("no dynamic symbol
+  # table") even when nm -gU has the answer.
+  { nm -gU "$lib" 2>/dev/null || true; nm -gD "$lib" 2>/dev/null || true; } \
+    | awk -v s="$sym" '
+        $NF == s || $NF == "_" s { f=1 }
+        END { exit !f }
+      '
 }
 
 # FPDF_InitLibrary is upstream's; always must be exported.

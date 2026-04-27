@@ -83,14 +83,23 @@ if [ ! -s "$LIB_PATH" ]; then
   exit 1
 fi
 
-# Symbol presence: FPDF_InitLibrary is upstream's, must always be exported.
+# Last-field equality on nm output. Handles both Mach-O (Apple's `_<sym>`
+# convention) and ELF (`<sym>`), and is whitespace-agnostic (the macos-15
+# runner's LLVM nm tab-separates fields where local LLVM nm space-separates
+# — awk's default FS handles both).
+sym_exported() {
+  local lib="$1" sym="$2"
+  nm -gU "$lib" 2>/dev/null | awk -v s="$sym" '
+    $NF == s || $NF == "_" s { f=1 }
+    END { exit !f }
+  '
+}
+
+# FPDF_InitLibrary is upstream's; always must be exported.
 SYMBOL_CHECK_OK=0
 case "$TARGET" in
   mac-*|linux-*)
-    if nm -gU "$LIB_PATH" 2>/dev/null | grep -q ' _\?FPDF_InitLibrary$' \
-       || nm -D  "$LIB_PATH" 2>/dev/null | grep -q ' FPDF_InitLibrary$'; then
-      SYMBOL_CHECK_OK=1
-    fi
+    sym_exported "$LIB_PATH" "FPDF_InitLibrary" && SYMBOL_CHECK_OK=1
     ;;
   win-*)
     if command -v dumpbin >/dev/null 2>&1; then
@@ -115,18 +124,13 @@ if [ -n "$DECL_SYMS" ]; then
   for sym in $DECL_SYMS; do
     case "$TARGET" in
       mac-*|linux-*)
-        if ! { nm -gU "$LIB_PATH" 2>/dev/null | grep -q " _\?${sym}$"; } \
-           && ! { nm -D  "$LIB_PATH" 2>/dev/null | grep -q " ${sym}$"; }; then
+        if ! sym_exported "$LIB_PATH" "$sym"; then
           echo "FAIL: declared symbol $sym not exported by $LIB_PATH" >&2
           # Dump diagnostics so the next CI failure tells us what's actually
           # in the dylib without needing another roundtrip.
           echo "--- diagnostic: $LIB_PATH ($(stat -f '%z' "$LIB_PATH" 2>/dev/null || stat -c '%s' "$LIB_PATH" 2>/dev/null) bytes) ---" >&2
-          echo "--- any FPDF-prefixed exports (first 20 of nm -gU): ---" >&2
-          nm -gU "$LIB_PATH" 2>/dev/null | grep -E '_?FPDF' | head -20 >&2 || true
           echo "--- any FPDFRejeb_-prefixed exports (nm -gU): ---" >&2
           nm -gU "$LIB_PATH" 2>/dev/null | grep -E '_?FPDFRejeb' >&2 || echo "(none)" >&2
-          echo "--- looking for fpdf_rejeb.o in build out: ---" >&2
-          find "$OUT_DIR/obj" -name 'fpdf_rejeb.o' 2>/dev/null | head -3 >&2 || true
           OBJ_FILE="$(find "$OUT_DIR/obj" -name 'fpdf_rejeb.o' 2>/dev/null | head -1)"
           if [ -n "$OBJ_FILE" ]; then
             echo "--- nm of $OBJ_FILE (FPDFRejeb): ---" >&2

@@ -23,14 +23,13 @@ int main(void) {
   config.m_v8EmbedderSlot   = 0;
   FPDF_InitLibraryWithConfig(&config);
 
-  /* When fpdf_rejeb.h is empty (M0), this section is a no-op.
-   * Once patches add FPDFRejeb_* declarations, add one call per
-   * symbol below — each with NULL/zero args — to verify it links.
-   * Example:
-   *
-   *   unsigned long out_size = 0;
-   *   (void)FPDFRejeb_TextObjGetCharCodes(NULL, NULL, 0, &out_size);
-   */
+  /* One call per FPDFRejeb_* symbol with NULL/zero args. PDFium's
+   * null-arg fast paths return immediately, so we only verify that
+   * the symbol links and doesn't crash on entry. */
+  {
+    unsigned long out_size = 0;
+    (void)FPDFRejeb_TextObjGetCharCodes(NULL, NULL, 0, &out_size);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

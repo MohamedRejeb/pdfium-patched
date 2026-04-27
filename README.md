@@ -8,10 +8,11 @@ Build-and-distribute pipeline for Google's [PDFium](https://pdfium.googlesource.
 
 ## Consuming releases
 
-Each tag publishes one zip per platform under
-`https://github.com/MohamedRejeb/pdfium-patched/releases/download/<tag>/libpdfium-<target>-<tag>.zip`.
+Each tag publishes one tgz per platform under
+`https://github.com/MohamedRejeb/pdfium-patched/releases/download/<tag>/pdfium-<target>.tgz`
+(filename pattern mirrors `bblanchon/pdfium-binaries`).
 
-Targets: `mac-arm64`, `mac-x64`, `linux-x64`, `win-x64`. Mac / Linux zip layout:
+Targets: `mac-arm64`, `mac-x64`, `linux-x64`, `win-x64`. Mac / Linux tgz layout:
 
 ```
 LICENSE              # PDFium's upstream license
@@ -33,7 +34,7 @@ lib/pdfium.dll.lib   # MSVC import library
 Gradle example (mirrors a bblanchon-style download task):
 
 ```kotlin
-val downloadUrl = "https://github.com/MohamedRejeb/pdfium-patched/releases/download/v${pdfiumVersion}+rejeb.${patchesVersion}/libpdfium-$os-$arch.zip"
+val downloadUrl = "https://github.com/MohamedRejeb/pdfium-patched/releases/download/v${pdfiumVersion}+rejeb.${patchesVersion}/pdfium-$os-$arch.tgz"
 ```
 
 ## Building locally

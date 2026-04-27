@@ -142,20 +142,25 @@ jobs:
         with:
           path: artifacts
 
-      - name: Repack into per-target zips
+      - name: Repack into per-target tgz
         run: |
           set -euo pipefail
-          mkdir -p release-zips
+          # Output filename and format mirror bblanchon/pdfium-binaries:
+          # pdfium-<target>.tgz with no version embedded (the version
+          # lives in the GitHub release tag URL path). Downstream
+          # consumers that hardcode the bblanchon URL pattern stay
+          # working when they swap the host to ours.
+          mkdir -p release-tgz
           for target in mac-arm64 mac-x64 linux-x64 win-x64; do
             src="artifacts/dist-$target"
             if [ ! -d "$src" ]; then
               echo "::error::missing artifact for $target"
               exit 1
             fi
-            zip_name="libpdfium-${target}-${GITHUB_REF_NAME}.zip"
-            (cd "$src" && zip -r "$GITHUB_WORKSPACE/release-zips/$zip_name" .)
+            out="$GITHUB_WORKSPACE/release-tgz/pdfium-${target}.tgz"
+            (cd "$src" && tar -czf "$out" .)
           done
-          ls -la release-zips/
+          ls -la release-tgz/
 
       - name: Create GitHub Release
         env:
@@ -165,4 +170,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
-            release-zips/*.zip
+            release-tgz/*.tgz

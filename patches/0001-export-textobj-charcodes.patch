@@ -1,0 +1,72 @@
+# Feature patch 0001 — export CPDF_TextObject::GetCharCodes()
+# as FPDFRejeb_TextObjGetCharCodes.
+#
+# Wraps a read-only PDFium accessor in a public FPDF_EXPORT function so
+# downstream consumers can read the raw character codes from a text page
+# object without going through PDFium internals. For CID fonts these are
+# CIDs; for simple fonts they are 1-byte codes. They are NOT unicode and
+# NOT the same as glyph IDs.
+#
+# Two-pass query pattern: pass NULL buffer + 0 size first to learn
+# |out_size|, then allocate and call again. Returns false on null args
+# or non-text object; true on success even if buffer was too small
+# (|out_size| is still set).
+diff --git a/BUILD.gn b/BUILD.gn
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -207,6 +207,7 @@
+     "public/fpdf_javascript.h",
+     "public/fpdf_ppo.h",
+     "public/fpdf_progressive.h",
++    "public/fpdf_rejeb.h",
+     "public/fpdf_save.h",
+     "public/fpdf_searchex.h",
+     "public/fpdf_signature.h",
+diff --git a/fpdfsdk/BUILD.gn b/fpdfsdk/BUILD.gn
+--- a/fpdfsdk/BUILD.gn
++++ b/fpdfsdk/BUILD.gn
+@@ -50,6 +50,7 @@
+     "fpdf_javascript.cpp",
+     "fpdf_ppo.cpp",
+     "fpdf_progressive.cpp",
++    "fpdf_rejeb.cpp",
+     "fpdf_save.cpp",
+     "fpdf_searchex.cpp",
+     "fpdf_signature.cpp",
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+new file mode 100644
+--- /dev/null
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -0,0 +1,32 @@
++// Copyright 2026 Mohamed Rejeb. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "public/fpdf_rejeb.h"
++
++#include "core/fpdfapi/page/cpdf_pageobject.h"
++#include "core/fpdfapi/page/cpdf_textobject.h"
++#include "fpdfsdk/cpdfsdk_helpers.h"
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_TextObjGetCharCodes(FPDF_PAGEOBJECT text_object,
++                              uint32_t* buffer,
++                              unsigned long buffer_size,
++                              unsigned long* out_size) {
++  if (!text_object || !out_size) {
++    return false;
++  }
++  CPDF_PageObject* page_obj = CPDFPageObjectFromFPDFPageObject(text_object);
++  CPDF_TextObject* text_obj = page_obj ? page_obj->AsText() : nullptr;
++  if (!text_obj) {
++    return false;
++  }
++  const auto& codes = text_obj->GetCharCodes();
++  *out_size = static_cast<unsigned long>(codes.size());
++  if (buffer && buffer_size >= codes.size()) {
++    for (size_t i = 0; i < codes.size(); ++i) {
++      buffer[i] = static_cast<uint32_t>(codes[i]);
++    }
++  }
++  return true;
++}

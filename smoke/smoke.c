@@ -43,6 +43,11 @@ int main(void) {
     (void)FPDFRejeb_TextGetSourceCharCode(NULL, 0);
     (void)FPDFRejeb_TextGetGlyphPath(NULL, 0, 0.0f);
   }
+  {
+    float fill_alpha = 0.0f;
+    float stroke_alpha = 0.0f;
+    (void)FPDFRejeb_PageObjGetAlpha(NULL, &fill_alpha, &stroke_alpha);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

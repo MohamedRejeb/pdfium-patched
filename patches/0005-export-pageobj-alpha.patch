@@ -1,0 +1,58 @@
+# Feature patch 0005 — export FPDFRejeb_PageObjGetAlpha for the
+# graphics-state fill alpha (ExtGState /ca) and stroke alpha (ExtGState
+# /CA) of a page object.
+#
+# Both values are already computed by PDFium's content-stream parser into
+# CPDF_GeneralState — there's just no public way to read them. Upstream
+# exposes a few ExtGState bits (blend mode, line dash) but not the
+# alphas, even though they're load-bearing for any caller trying to
+# replay the rendered look (e.g. compositing annotations on top).
+#
+# Empty-state behaviour: when the object's gstate has no ExtGState ref
+# at all (PDF objects usually don't unless explicitly set), both
+# out-params are filled with 1.0 (the PDF default for ca/CA) and the
+# function returns true. This lets callers `multiply *= alpha` without
+# branching on the "no ExtGState" path.
+#
+# Returns false only on null arguments (page_object / either out-param).
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index 1a9fd04..47bd046 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -7,6 +7,7 @@
+ #include "public/fpdf_rejeb.h"
+ 
+ #include "core/fpdfapi/font/cpdf_font.h"
++#include "core/fpdfapi/page/cpdf_generalstate.h"
+ #include "core/fpdfapi/page/cpdf_occontext.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
+@@ -205,3 +206,28 @@ FPDFRejeb_TextGetGlyphPath(FPDF_TEXTPAGE text_page,
+       cfx_font->LoadGlyphPath(pos[0].glyph_index_, pos[0].font_char_width_);
+   return reinterpret_cast<FPDF_GLYPHPATH>(path);
+ }
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_PageObjGetAlpha(FPDF_PAGEOBJECT page_object,
++                          float* fill_alpha,
++                          float* stroke_alpha) {
++  if (!page_object || !fill_alpha || !stroke_alpha) {
++    return false;
++  }
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj) {
++    return false;
++  }
++  const CPDF_GeneralState& gs = obj->general_state();
++  if (!gs.HasRef()) {
++    // No ExtGState attached — PDF default for both alpha channels is 1.0.
++    // Return true so callers can blindly multiply without branching on the
++    // empty-state case.
++    *fill_alpha = 1.0f;
++    *stroke_alpha = 1.0f;
++    return true;
++  }
++  *fill_alpha = gs.GetFillAlpha();
++  *stroke_alpha = gs.GetStrokeAlpha();
++  return true;
++}

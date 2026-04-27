@@ -130,6 +130,25 @@ FPDFRejeb_TextGetGlyphPath(FPDF_TEXTPAGE text_page,
                            int char_index,
                            float font_size);
 
+// Writes |page_object|'s graphics-state fill alpha (ExtGState /ca) into
+// |fill_alpha| and stroke alpha (ExtGState /CA) into |stroke_alpha|. Both
+// values are in [0.0, 1.0]; the PDF default is 1.0 (fully opaque).
+//
+// When the object has no ExtGState attached (the common case — most PDF
+// objects don't set one explicitly), both out-params are filled with 1.0
+// and the function returns true. This lets callers `multiply *= alpha`
+// blindly without branching on the empty-state case.
+//
+// Returns false only on null arguments (page_object / either out-param).
+//
+// Backed by patches/0005-export-pageobj-alpha.patch wrapping
+// CPDF_GeneralState::GetFillAlpha / GetStrokeAlpha via
+// CPDF_PageObject::general_state() in core/fpdfapi/page/cpdf_generalstate.h.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_PageObjGetAlpha(FPDF_PAGEOBJECT page_object,
+                          float* fill_alpha,
+                          float* stroke_alpha);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

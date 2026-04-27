@@ -1,0 +1,48 @@
+# Feature patch 0003 — export FPDFRejeb_TextGetSourceCharCode, an indexed
+# accessor that maps a CPDF_TextPage visual char index back to the
+# source-stream charcode for that char.
+#
+# Annodoc M1.1 follow-up to FPDFRejeb_TextObjGetCharCodes (patch 0001):
+# 0001 returns the charcode array for one CPDF_TextObject; 0003 lets the
+# caller skip the m_pTextObj + m_Index walk and ask CPDF_TextPage
+# directly for char N. PDFium already resolves visual reordering (RTL)
+# and ligature decomposition into per-char CharInfo entries, each of
+# which stores the source charcode — so this is just a lookup.
+#
+# Returns 0 on null / out-of-range / negative index. Note that 0 is
+# also a valid charcode for some fonts (typically .notdef), so callers
+# that need to disambiguate "error" from "real char 0" should validate
+# |char_index| against FPDFText_CountChars before calling.
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index 6e00e00..d416bbb 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -10,6 +10,7 @@
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdftext/cpdf_textpage.h"
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/retain_ptr.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+@@ -127,3 +128,20 @@ FPDFRejeb_GetOCGName(FPDF_DOCUMENT document,
+       ocg->GetUnicodeTextFor("Name"),
+       UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
+ }
++
++FPDF_EXPORT uint32_t FPDF_CALLCONV
++FPDFRejeb_TextGetSourceCharCode(FPDF_TEXTPAGE text_page, int char_index) {
++  if (!text_page || char_index < 0) {
++    return 0;
++  }
++  CPDF_TextPage* tp = CPDFTextPageFromFPDFTextPage(text_page);
++  if (!tp || static_cast<size_t>(char_index) >= tp->size()) {
++    return 0;
++  }
++  // CPDF_TextPage::CharInfo already stores the resolved source-stream
++  // charcode per visual char — no need to chase m_pTextObj + m_Index
++  // ourselves. Returns the same value the underlying CPDF_TextObject
++  // exposes via GetCharCodes() (CIDs for CID fonts, 1-byte codes for
++  // simple fonts).
++  return tp->GetCharInfo(static_cast<size_t>(char_index)).char_code();
++}

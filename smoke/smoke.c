@@ -39,6 +39,9 @@ int main(void) {
     (void)FPDFRejeb_GetOCGCount(NULL);
     (void)FPDFRejeb_GetOCGName(NULL, 0, NULL, 0);
   }
+  {
+    (void)FPDFRejeb_TextGetSourceCharCode(NULL, 0);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

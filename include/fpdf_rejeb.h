@@ -87,6 +87,26 @@ FPDFRejeb_GetOCGName(FPDF_DOCUMENT document,
                      void* buffer,
                      unsigned long buflen);
 
+// Returns the source-stream charcode for the char at |char_index| of
+// |text_page|. Indexed accessor that handles RTL/visual reordering and
+// ligature decomposition the same way PDFium does internally — each
+// CPDF_TextPage::CharInfo already carries the resolved source charcode,
+// so callers don't need to walk the underlying CPDF_TextObject manually.
+//
+// Returns the same kind of value FPDFRejeb_TextObjGetCharCodes does
+// (CIDs for CID fonts, 1-byte codes for simple fonts).
+//
+// Returns 0 on null |text_page| or out-of-range |char_index|. Note that
+// 0 is also a valid charcode for some fonts (typically .notdef), so
+// callers that need to disambiguate should validate |char_index| against
+// FPDFText_CountChars first.
+//
+// Backed by patches/0003-export-textpage-source-charcode.patch wrapping
+// CPDF_TextPage::GetCharInfo(index).char_code() in
+// core/fpdftext/cpdf_textpage.h.
+FPDF_EXPORT uint32_t FPDF_CALLCONV
+FPDFRejeb_TextGetSourceCharCode(FPDF_TEXTPAGE text_page, int char_index);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -1,0 +1,53 @@
+# Build infrastructure patch (always applied; not counted in PATCHES_VERSION).
+#
+# Two iOS-specific tweaks vendored from bblanchon/pdfium-binaries:
+#
+#  1) core/fxge/BUILD.gn — extend the apple/fx_apple_impl.cpp sources
+#     branch to include `is_ios`, not just `is_mac`. Without this the
+#     iOS build is missing the apple-specific font/glyph implementation
+#     (PDFium upstream gates it on is_mac only because Chrome doesn't
+#     ship PDFium on iOS — bblanchon and we both do).
+#
+#  2) testing/test.gni — drop the `ios_automatically_manage_certs`
+#     bundle-id-suffix override. The override forces a single shared
+#     bundle id across unit tests so the free Apple-cert tier doesn't
+#     run out of identifiers. We don't sign / manage certs in this
+#     pipeline (`ios_enable_code_signing = false`), so the override is
+#     dead weight; removing it lets the gn config evaluate even when
+#     `ios_automatically_manage_certs` isn't defined in the gn args
+#     namespace at our pinned chromium/7811.
+#
+# Both target pdfium/ proper (not the //build sibling checkout) so no
+# Apply-from header is needed; 02-apply-patches.sh defaults to PDFIUM_DIR.
+#
+# Source: bblanchon/pdfium-binaries patches/ios/pdfium.patch
+# (BSD-3-Clause). Vendored verbatim.
+diff --git a/core/fxge/BUILD.gn b/core/fxge/BUILD.gn
+index a4deadb1c..12994a22a 100644
+--- a/core/fxge/BUILD.gn
++++ b/core/fxge/BUILD.gn
+@@ -167,7 +167,7 @@ source_set("fxge") {
+     sources += [ "linux/fx_linux_impl.cpp" ]
+   }
+
+-  if (is_mac) {
++  if (is_mac || is_ios) {
+     sources += [
+       "apple/fx_apple_impl.cpp",
+       "apple/fx_apple_platform.cpp",
+diff --git a/testing/test.gni b/testing/test.gni
+index 9d528da98..2c2a6706f 100644
+--- a/testing/test.gni
++++ b/testing/test.gni
+@@ -207,11 +207,6 @@ template("test") {
+       }
+
+       _bundle_id_suffix = target_name
+-      if (ios_automatically_manage_certs) {
+-        # Use the same bundle identifier for all unit tests when managing
+-        # certificates automatically as the number of free certs is limited.
+-        _bundle_id_suffix = "generic-unit-test"
+-      }
+       if (!defined(extra_substitutions)) {
+         extra_substitutions = []
+       }

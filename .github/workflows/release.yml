@@ -48,6 +48,12 @@ jobs:
             target: android-x86
           - os: ubuntu-22.04
             target: android-x64
+          - os: macos-15
+            target: ios-device-arm64
+          - os: macos-15
+            target: ios-simulator-arm64
+          - os: macos-15
+            target: ios-simulator-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -159,7 +165,7 @@ jobs:
           # consumers that hardcode the bblanchon URL pattern stay
           # working when they swap the host to ours.
           mkdir -p release-tgz
-          for target in mac-arm64 mac-x64 linux-x64 win-x64 android-arm android-arm64 android-x86 android-x64; do
+          for target in mac-arm64 mac-x64 linux-x64 win-x64 android-arm android-arm64 android-x86 android-x64 ios-device-arm64 ios-simulator-arm64 ios-simulator-x64; do
             src="artifacts/dist-$target"
             if [ ! -d "$src" ]; then
               echo "::error::missing artifact for $target"

@@ -34,6 +34,12 @@ jobs:
             target: android-x86
           - os: ubuntu-22.04
             target: android-x64
+          - os: macos-15
+            target: ios-device-arm64
+          - os: macos-15
+            target: ios-simulator-arm64
+          - os: macos-15
+            target: ios-simulator-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:

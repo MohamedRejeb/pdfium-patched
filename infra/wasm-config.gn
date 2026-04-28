@@ -1,0 +1,19 @@
+# Drop-in for //build/config/wasm/BUILD.gn (does not exist upstream).
+# 02-apply-patches.sh copies this file into pdfium/build/config/wasm/
+# after applying infra/0006-wasm-build.patch, which references the
+# //build/config/wasm:compiler target defined here.
+#
+# Defines a single config exporting _POSIX_C_SOURCE so libopenjpeg20
+# (vendored under pdfium/third_party/libopenjpeg) sees fseeko/ftello.
+# See: https://github.com/emscripten-core/emscripten/issues/4932
+#
+# Source: bblanchon/pdfium-binaries patches/wasm/config.gn (BSD-3-Clause).
+# Vendored verbatim.
+
+config("compiler") {
+  defines = [
+    # Enable fseeko() and ftello() (required by libopenjpeg20)
+    # https://github.com/emscripten-core/emscripten/issues/4932
+    "_POSIX_C_SOURCE=200112",
+  ]
+}

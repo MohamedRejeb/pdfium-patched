@@ -40,6 +40,8 @@ jobs:
             target: ios-simulator-arm64
           - os: macos-15
             target: ios-simulator-x64
+          - os: ubuntu-22.04
+            target: wasm
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:

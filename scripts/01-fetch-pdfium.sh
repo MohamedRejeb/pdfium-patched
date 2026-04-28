@@ -6,7 +6,10 @@
 #   * android-* → writes target_os = ['android'] into .gclient before sync
 #                 so gclient hooks fetch the Android NDK toolchain, then
 #                 runs build/install-build-deps.sh --android for apt deps.
-#   * ios-*     → writes target_os = ['ios'] (Phase 2; no extras needed).
+#   * ios-*     → writes target_os = ['ios']; no extras needed.
+#   * wasm      → writes target_os = ['emscripten'] and clones + activates
+#                 emsdk EMSDK_VERSION (3.1.72 — pinned to bblanchon's
+#                 verified-working version). Adds emcc/em++/llvm-nm to PATH.
 #   * default   → host-OS build, no target_os, no extra setup.
 #
 # Cache-friendly: .gclient is rewritten on every run so cached pdfium/
@@ -21,11 +24,14 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
+EMSDK_VERSION="${EMSDK_VERSION:-3.1.72}"
+
 TARGET="${1:-}"
 TARGET_OS=""
 case "$TARGET" in
   android-*) TARGET_OS="android" ;;
   ios-*)     TARGET_OS="ios" ;;
+  wasm)      TARGET_OS="emscripten" ;;
   # mac-*, linux-*, win-*, "" → host build, no target_os entry needed.
 esac
 
@@ -64,6 +70,31 @@ if [ "$TARGET_OS" = "android" ]; then
     ( cd pdfium && gclient runhooks )
   else
     echo "warn: skipping Android build-deps install — host is $(uname -s), not Linux" >&2
+  fi
+fi
+
+# WASM build needs the Emscripten SDK on PATH so the //build/toolchain/wasm
+# gn toolchain can find emcc / em++ / llvm-nm. Install into the PDFium
+# third_party tree (matches bblanchon's layout: emsdk_path resolves
+# //third_party/emsdk relative to PDFium root).
+if [ "$TARGET_OS" = "emscripten" ]; then
+  EMSDK_DIR="$ROOT/pdfium/pdfium/third_party/emsdk"
+  echo ">>> install Emscripten SDK $EMSDK_VERSION → $EMSDK_DIR"
+  if [ ! -d "$EMSDK_DIR/.git" ]; then
+    git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$EMSDK_DIR"
+  else
+    git -C "$EMSDK_DIR" fetch --depth 1 origin main
+    git -C "$EMSDK_DIR" reset --hard origin/main
+  fi
+  ( cd "$EMSDK_DIR" && ./emsdk install "$EMSDK_VERSION" && ./emsdk activate "$EMSDK_VERSION" )
+  # Add emscripten tools to the workflow's PATH so 04-build.sh's em++
+  # link step can invoke them. Locally, source emsdk/emsdk_env.sh.
+  if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "$EMSDK_DIR/upstream/emscripten" >> "$GITHUB_PATH"
+    echo "$EMSDK_DIR/upstream/bin" >> "$GITHUB_PATH"
+  else
+    echo "warn: GITHUB_PATH not set — for local wasm builds, run:"
+    echo "      source $EMSDK_DIR/emsdk_env.sh"
   fi
 fi
 

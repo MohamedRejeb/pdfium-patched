@@ -22,12 +22,26 @@ output to match what downstream consumers expect:
     is_mac only because Chrome doesn't ship PDFium on iOS), and drop
     the `ios_automatically_manage_certs` branch in testing/test.gni
     that references a gn arg we don't define.
+  * 0005-wasm-pdfium.patch — three small additions teaching PDFium
+    that wasm is "posix-like" (fxcrt) and "linux-like" (fxge), plus
+    silencing skia_opts' "Unsupported target CPU" assert for wasm.
+  * 0006-wasm-build.patch — //build-side enablement for emscripten:
+    register a default toolchain for target_os=emscripten in
+    BUILDCONFIG.gn, pull our config/wasm:compiler config from
+    config/compiler/BUILD.gn, and silence unknown-warning-option
+    in toolchain/wasm/BUILD.gn so emcc doesn't reject chromium
+    warning flags. Carries `Apply-from: build`.
+  * wasm-config.gn (file copy, not a patch) — drop-in for
+    //build/config/wasm/BUILD.gn defining the //build/config/wasm:compiler
+    target referenced from 0006. 02-apply-patches.sh copies it after
+    patches apply.
 
 All patches are vendored verbatim (with minor trim of unused Windows
 metadata in 0001) from bblanchon/pdfium-binaries, BSD-3-Clause licensed.
 Re-vendor when bumping PDFIUM_VERSION if upstream PDFium / //build
 drifts in the patched files (BUILD.gn, public/fpdfview.h,
 public/cpp/fpdf_*.h, build/config/BUILDCONFIG.gn, core/fxge/BUILD.gn,
-testing/test.gni).
+testing/test.gni, core/fxcrt/BUILD.gn, skia/BUILD.gn,
+build/config/compiler/BUILD.gn, build/toolchain/wasm/BUILD.gn).
 
 Source: https://github.com/bblanchon/pdfium-binaries/tree/master/patches

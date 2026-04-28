@@ -1,0 +1,65 @@
+# Build infrastructure patch (always applied; not counted in PATCHES_VERSION).
+#
+# Three small WASM-aware extensions to PDFium source proper. PDFium
+# upstream has no first-class emscripten/wasm support — these patches
+# tell the gn graph that wasm is "posix-like" and "linux-like" enough
+# to pull in the right impl files, and silence a hard assert that the
+# wasm CPU is unsupported by skia_opts.
+#
+#   1) core/fxcrt/BUILD.gn — extend the `if (is_posix)` branch that
+#      pulls in cfx_fileaccess_posix to also include `is_wasm`.
+#      Emscripten's libc is posix-shaped and has open()/read()/close().
+#
+#   2) core/fxge/BUILD.gn — extend the `if (is_linux || is_chromeos)`
+#      branch that pulls in fx_linux_impl.cpp to also include `is_wasm`.
+#      The "linux" impl is largely fontconfig + standard fopen / mmap
+#      and works under emscripten too.
+#
+#   3) skia/BUILD.gn — comment out the `assert(false, "Unsupported
+#      target CPU ...")` in skia_opts so the wasm CPU doesn't trip it.
+#      skia_opts on wasm is just the scalar fallback path.
+#
+# All three apply to pdfium/ proper (not //build), so no Apply-from
+# header is needed; 02-apply-patches.sh defaults to PDFIUM_DIR.
+#
+# Source: bblanchon/pdfium-binaries patches/wasm/pdfium.patch
+# (BSD-3-Clause). Vendored verbatim.
+diff --git a/core/fxcrt/BUILD.gn b/core/fxcrt/BUILD.gn
+index 796a10a..abcbc2d 100644
+--- a/core/fxcrt/BUILD.gn
++++ b/core/fxcrt/BUILD.gn
+@@ -159,7 +159,7 @@ source_set("fxcrt") {
+   } else {
+     sources += [ "fx_memory_malloc.cpp" ]
+   }
+-  if (is_posix) {
++  if (is_posix || is_wasm) {
+     sources += [
+       "cfx_fileaccess_posix.cpp",
+       "cfx_fileaccess_posix.h",
+diff --git a/core/fxge/BUILD.gn b/core/fxge/BUILD.gn
+index 933f538..3df15ad 100644
+--- a/core/fxge/BUILD.gn
++++ b/core/fxge/BUILD.gn
+@@ -166,7 +166,7 @@ source_set("fxge") {
+     ]
+   }
+
+-  if (is_linux || is_chromeos) {
++  if (is_linux || is_chromeos || is_wasm) {
+     sources += [ "linux/fx_linux_impl.cpp" ]
+   }
+
+diff --git a/skia/BUILD.gn b/skia/BUILD.gn
+index 67e1360..3340926 100644
+--- a/skia/BUILD.gn
++++ b/skia/BUILD.gn
+@@ -513,7 +513,7 @@ skia_source_set("skia_opts") {
+   } else if (current_cpu == "mipsel" || current_cpu == "mips64el") {
+     cflags += [ "-fomit-frame-pointer" ]
+   } else {
+-    assert(false, "Unsupported target CPU " + current_cpu)
++    # assert(false, "Unsupported target CPU " + current_cpu)
+   }
+
+   if (is_android && !is_debug) {

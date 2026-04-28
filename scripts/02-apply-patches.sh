@@ -80,4 +80,16 @@ apply_patches features "$ROOT/patches"
 echo ">>> drop fpdf_rejeb.h into PDFium public/"
 cp "$ROOT/include/fpdf_rejeb.h" "$PDFIUM_DIR/public/fpdf_rejeb.h"
 
+# Wasm build config: infra/0006-wasm-build.patch references the
+# //build/config/wasm:compiler target which doesn't exist upstream.
+# Drop our small BUILD.gn defining it. Harmless on non-wasm builds —
+# nothing pulls it in unless target_os=emscripten.
+WASM_CONFIG_SRC="$ROOT/infra/wasm-config.gn"
+WASM_CONFIG_DEST="$PDFIUM_DIR/build/config/wasm/BUILD.gn"
+if [ -f "$WASM_CONFIG_SRC" ]; then
+  echo ">>> drop infra/wasm-config.gn → build/config/wasm/BUILD.gn"
+  mkdir -p "$(dirname "$WASM_CONFIG_DEST")"
+  cp "$WASM_CONFIG_SRC" "$WASM_CONFIG_DEST"
+fi
+
 echo "OK: patches applied"

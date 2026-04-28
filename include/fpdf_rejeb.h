@@ -149,6 +149,49 @@ FPDFRejeb_PageObjGetAlpha(FPDF_PAGEOBJECT page_object,
                           float* fill_alpha,
                           float* stroke_alpha);
 
+// Returns the CPDF_TextPage::CharType enum value for the char at
+// |char_index| of |text_page|. Lets callers tell |FPDFRejeb_TextGetGlyphPath|
+// nulls that are *expected* (kGenerated) apart from those that indicate
+// a real extraction failure (Type 3 font, empty char-pos lookup, etc.).
+//
+// Mapping (mirrors PDFium's CPDF_TextPage::CharType enum):
+//   0 = kNormal       — real char, has source charcode
+//   1 = kGenerated    — synthesized (decomposed ligature, line-break artifact)
+//   2 = kNotUnicode   — char without unicode mapping
+//   3 = kHyphen       — auto-inserted at line break
+//   4 = kPiece        — sub-piece of a multi-glyph char (non-rendered)
+//
+// Returns -1 on null |text_page| or out-of-range |char_index|.
+//
+// Backed by patches/0006-export-textpage-charinfo-type.patch wrapping
+// CPDF_TextPage::GetCharInfo(index).char_type() in
+// core/fpdftext/cpdf_textpage.h.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_TextGetCharType(FPDF_TEXTPAGE text_page, int char_index);
+
+// Returns |page_object|'s graphics-state blend mode (ExtGState /BM) as an
+// int matching PDFium's BlendMode enum (declared in core/fxge/dib/fx_dib.h):
+//
+//   0  = kNormal       1  = kMultiply     2  = kScreen       3  = kOverlay
+//   4  = kDarken       5  = kLighten      6  = kColorDodge   7  = kColorBurn
+//   8  = kHardLight    9  = kSoftLight    10 = kDifference   11 = kExclusion
+//   12 = kHue          13 = kSaturation   14 = kColor        15 = kLuminosity
+//
+// Note: PDFium 7811's enum is dense; older revisions had a value gap
+// between kExclusion and kHue. Map these by name on the consumer side
+// to stay robust across PDFium bumps.
+//
+// When the object has no ExtGState attached (the common case for
+// ordinary page content), returns kNormal (0) — the PDF default — so
+// callers can treat blend mode as always-present.
+//
+// Returns -1 only on null |page_object|.
+//
+// Backed by patches/0007-export-pageobj-blendmode.patch wrapping
+// CPDF_GeneralState::GetBlendType() via CPDF_PageObject::general_state().
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_PageObjGetBlendMode(FPDF_PAGEOBJECT page_object);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -48,6 +48,10 @@ int main(void) {
     float stroke_alpha = 0.0f;
     (void)FPDFRejeb_PageObjGetAlpha(NULL, &fill_alpha, &stroke_alpha);
   }
+  {
+    (void)FPDFRejeb_TextGetCharType(NULL, 0);
+    (void)FPDFRejeb_PageObjGetBlendMode(NULL);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

@@ -1,0 +1,45 @@
+# Feature patch 0006 — export FPDFRejeb_TextGetCharType, an indexed
+# accessor for CPDF_TextPage::CharInfo::char_type().
+#
+# Pairs with patch 0004 (FPDFRejeb_TextGetGlyphPath). That patch returns
+# NULL for several distinct reasons (kGenerated artifacts, Type 3 fonts,
+# empty char-pos lookup, etc.) and the engine cannot tell them apart.
+# kGenerated chars (decomposed-ligature artifacts, line-break spaces) are
+# *correctly* null and should be silently skipped — but real null-returning
+# cases are extraction failures the engine needs to react to.
+#
+# This accessor exposes char_type as an int so the engine can branch on
+# the expected-vs-real distinction. Mapping mirrors PDFium's enum:
+#   0 = kNormal       — real char, has source charcode
+#   1 = kGenerated    — synthesized (decomposed ligature, line-break artifact)
+#   2 = kNotUnicode   — char without unicode mapping
+#   3 = kHyphen       — auto-inserted at line break
+#   4 = kPiece        — sub-piece of a multi-glyph char (non-rendered)
+#
+# Returns -1 on null text_page or out-of-range char_index. The kGenerated
+# enum value (1) is the one Annodoc filters on — every other -1 / non-1
+# return is "real glyph, real failure".
+#
+# No new includes — patch 0004 already pulls in core/fpdftext/cpdf_textpage.h
+# for CPDF_TextPage::GetCharInfo / CharInfo::char_code().
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index 47bd046..bfac53e 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -231,3 +231,16 @@ FPDFRejeb_PageObjGetAlpha(FPDF_PAGEOBJECT page_object,
+   *stroke_alpha = gs.GetStrokeAlpha();
+   return true;
+ }
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_TextGetCharType(FPDF_TEXTPAGE text_page, int char_index) {
++  if (!text_page || char_index < 0) {
++    return -1;
++  }
++  CPDF_TextPage* tp = CPDFTextPageFromFPDFTextPage(text_page);
++  if (!tp || static_cast<size_t>(char_index) >= tp->size()) {
++    return -1;
++  }
++  return static_cast<int>(
++      tp->GetCharInfo(static_cast<size_t>(char_index)).char_type());
++}

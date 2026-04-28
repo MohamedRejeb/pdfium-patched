@@ -1,0 +1,66 @@
+# Feature patch 0007 — export FPDFRejeb_PageObjGetBlendMode for the
+# graphics-state blend mode (ExtGState /BM) of a page object.
+#
+# PDFium parses /BM into CPDF_GeneralState's blend_type_ during
+# content-stream evaluation. Upstream exposes some ExtGState bits (e.g.
+# blend mode as a string via GetBlendMode()) but not the parsed enum
+# value, even though it's load-bearing for callers replaying the rendered
+# look — highlight markers blended Multiply, soft-light overlays, and so
+# on. The Annodoc engine has been guessing Multiply for every transparent
+# image because no public getter existed for the actual mode; this lets
+# it map the real BlendMode enum value back to the host's compositing op.
+#
+# The returned int matches PDFium's BlendMode enum (declared in
+# core/fxge/dib/fx_dib.h):
+#   0  = kNormal       1  = kMultiply     2  = kScreen       3  = kOverlay
+#   4  = kDarken       5  = kLighten      6  = kColorDodge   7  = kColorBurn
+#   8  = kHardLight    9  = kSoftLight    10 = kDifference   11 = kExclusion
+#   12 = kHue          13 = kSaturation   14 = kColor        15 = kLuminosity
+# (PDFium 7811's enum is dense — earlier PDFium revisions had separable
+# and non-separable groups split with a value gap; the Annodoc-side
+# Kotlin enum should map by name, not by absolute integer, to stay robust.)
+#
+# Empty-state behaviour: when the object has no ExtGState ref attached
+# (the common case), returns kNormal (0) — the PDF default. This lets
+# callers treat blend mode as always-present.
+#
+# Returns -1 only on null page_object.
+#
+# Adds include core/fxge/dib/fx_dib.h for the BlendMode enum definition.
+# (cpdf_generalstate.h already pulls it transitively, but explicit is
+# safer against future header reshuffles.)
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index bfac53e..749ec9a 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -18,6 +18,7 @@
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/retain_ptr.h"
+ #include "core/fxge/cfx_font.h"
++#include "core/fxge/dib/fx_dib.h"
+ #include "core/fxge/text_char_pos.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+
+@@ -244,3 +245,22 @@ FPDFRejeb_TextGetCharType(FPDF_TEXTPAGE text_page, int char_index) {
+   return static_cast<int>(
+       tp->GetCharInfo(static_cast<size_t>(char_index)).char_type());
+ }
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_PageObjGetBlendMode(FPDF_PAGEOBJECT page_object) {
++  if (!page_object) {
++    return -1;
++  }
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj) {
++    return -1;
++  }
++  const CPDF_GeneralState& gs = obj->general_state();
++  if (!gs.HasRef()) {
++    // No ExtGState attached — PDF default for the blend mode is Normal.
++    // Returning the default lets callers treat blend mode as always-present
++    // (multiply, screen, ...), no branch on the empty-state case.
++    return static_cast<int>(BlendMode::kNormal);
++  }
++  return static_cast<int>(gs.GetBlendType());
++}

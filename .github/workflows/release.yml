@@ -40,6 +40,14 @@ jobs:
             target: linux-x64
           - os: windows-2022
             target: win-x64
+          - os: ubuntu-22.04
+            target: android-arm
+          - os: ubuntu-22.04
+            target: android-arm64
+          - os: ubuntu-22.04
+            target: android-x86
+          - os: ubuntu-22.04
+            target: android-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -98,7 +106,7 @@ jobs:
 
       - name: Fetch PDFium
         shell: bash
-        run: ./scripts/01-fetch-pdfium.sh
+        run: ./scripts/01-fetch-pdfium.sh ${{ matrix.target }}
 
       - name: Apply patches
         shell: bash
@@ -151,7 +159,7 @@ jobs:
           # consumers that hardcode the bblanchon URL pattern stay
           # working when they swap the host to ours.
           mkdir -p release-tgz
-          for target in mac-arm64 mac-x64 linux-x64 win-x64; do
+          for target in mac-arm64 mac-x64 linux-x64 win-x64 android-arm android-arm64 android-x86 android-x64; do
             src="artifacts/dist-$target"
             if [ ! -d "$src" ]; then
               echo "::error::missing artifact for $target"

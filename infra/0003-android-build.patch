@@ -1,0 +1,34 @@
+# Build infrastructure patch (always applied; not counted in PATCHES_VERSION).
+#
+# Strip the `hide_all_but_jni_onload` config from the default
+# shared_library configs on Android. Chromium's android shared_library
+# default applies `-fvisibility=hidden` plus a linker `--exclude-libs ALL`
+# pass that strips every C symbol whose name doesn't match `JNI_OnLoad`,
+# because the typical Android shared lib is a JNI extension that exposes
+# nothing else. PDFium isn't — we need every FPDF_*, FORM_*, and
+# FPDFRejeb_* symbol surfaced for downstream consumers (Annodoc binds via
+# JNI but resolves the FPDF symbols by name, not via JNI_OnLoad).
+#
+# The patch lives in the //build/ checkout (a separate gclient-managed
+# git repo inside pdfium/), not in pdfium/ proper, so it carries an
+# Apply-from: marker that 02-apply-patches.sh uses to cd into the right
+# directory before `git apply`.
+#
+# Source: bblanchon/pdfium-binaries patches/android/build.patch
+# (BSD-3-Clause). Vendored verbatim.
+#
+# Apply-from: build
+diff --git a/config/BUILDCONFIG.gn b/config/BUILDCONFIG.gn
+index 105e194..50499f6 100644
+--- a/config/BUILDCONFIG.gn
++++ b/config/BUILDCONFIG.gn
+@@ -479,6 +479,9 @@ if (is_fuchsia) {
+ }
+ set_defaults("shared_library") {
+   configs = default_shared_library_configs
++  if (is_android) {
++    configs -= [ "//build/config/android:hide_all_but_jni_onload" ]
++  }
+ }
+ set_defaults("loadable_module") {
+   configs = default_shared_library_configs

@@ -26,6 +26,14 @@ jobs:
             target: linux-x64
           - os: windows-2022
             target: win-x64
+          - os: ubuntu-22.04
+            target: android-arm
+          - os: ubuntu-22.04
+            target: android-arm64
+          - os: ubuntu-22.04
+            target: android-x86
+          - os: ubuntu-22.04
+            target: android-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -98,7 +106,7 @@ jobs:
 
       - name: Fetch PDFium
         shell: bash
-        run: ./scripts/01-fetch-pdfium.sh
+        run: ./scripts/01-fetch-pdfium.sh ${{ matrix.target }}
 
       - name: Apply patches
         shell: bash

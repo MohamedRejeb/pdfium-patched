@@ -11,10 +11,17 @@ output to match what downstream consumers expect:
   * 0002-public-headers.patch — flatten public/cpp include paths and
     always-define FPDF_EXPORT so consumers can link without needing
     COMPONENT_BUILD.
+  * 0003-android-build.patch — strip `hide_all_but_jni_onload` from
+    android shared_library defaults so PDFium's exported FPDF_*
+    symbols survive the link (chromium's default is to hide every
+    symbol that isn't JNI_OnLoad). Lives in //build (a separate
+    gclient checkout); carries an `Apply-from: build` header so
+    02-apply-patches.sh routes it to the right tree.
 
-Both patches are vendored verbatim (with minor trim of unused Windows
-metadata) from bblanchon/pdfium-binaries, BSD-3-Clause licensed.
-Re-vendor when bumping PDFIUM_VERSION if upstream PDFium drifts in the
-patched files (BUILD.gn, public/fpdfview.h, public/cpp/fpdf_*.h).
+All patches are vendored verbatim (with minor trim of unused Windows
+metadata in 0001) from bblanchon/pdfium-binaries, BSD-3-Clause licensed.
+Re-vendor when bumping PDFIUM_VERSION if upstream PDFium / //build
+drifts in the patched files (BUILD.gn, public/fpdfview.h,
+public/cpp/fpdf_*.h, build/config/BUILDCONFIG.gn).
 
 Source: https://github.com/bblanchon/pdfium-binaries/tree/master/patches

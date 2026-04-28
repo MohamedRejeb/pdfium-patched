@@ -2,7 +2,8 @@
 # 03-configure.sh <target> — gn gen the build directory using
 # args/<target>.args.gn. Idempotent: re-running just regenerates ninja files.
 #
-# target ∈ {mac-arm64, mac-x64, linux-x64, win-x64}
+# target ∈ {mac-arm64, mac-x64, linux-x64, win-x64,
+#           android-arm, android-arm64, android-x86, android-x64}
 set -euo pipefail
 
 ROOT="${PDFIUM_PATCHED_ROOT:-$(pwd)}"
@@ -10,7 +11,7 @@ PDFIUM_DIR="$ROOT/pdfium/pdfium"
 
 TARGET="${1:-}"
 if [ -z "$TARGET" ]; then
-  echo "usage: $0 <mac-arm64|mac-x64|linux-x64|win-x64>" >&2
+  echo "usage: $0 <mac-arm64|mac-x64|linux-x64|win-x64|android-arm|android-arm64|android-x86|android-x64>" >&2
   exit 1
 fi
 

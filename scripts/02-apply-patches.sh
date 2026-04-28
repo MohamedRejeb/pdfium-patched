@@ -3,8 +3,16 @@
 # infra/ patches (always), then patches/ feature patches in lexical
 # order. Finally, copy our public header into PDFium's public/ dir.
 #
+# Patches are applied from $PDFIUM_DIR by default. A patch can opt into
+# being applied from a sub-checkout (e.g. //build, which is its own
+# gclient-managed git repo) by including a header line of the form:
+#
+#   # Apply-from: <subdir>
+#
+# The android infra patch uses this to land in pdfium/build/.
+#
 # Idempotent: re-running is safe but destroys any manual edits inside
-# pdfium/pdfium/ via git reset --hard + git clean -fd.
+# pdfium/pdfium/ (and the listed sub-checkouts) via git reset --hard.
 set -euo pipefail
 
 ROOT="${PDFIUM_PATCHED_ROOT:-$(pwd)}"
@@ -15,11 +23,19 @@ if [ ! -d "$PDFIUM_DIR" ]; then
   exit 1
 fi
 
-cd "$PDFIUM_DIR"
-
-echo ">>> reset PDFium working tree to clean state"
-git reset --hard HEAD
-git clean -fd
+# Reset every git checkout we might patch. //build is gclient-managed
+# alongside pdfium/, so a previous infra patch on it survives a sync
+# unless we hard-reset it explicitly.
+reset_checkout() {
+  local dir="$1"
+  if [ -d "$dir/.git" ] || [ -f "$dir/.git" ]; then
+    echo ">>> reset $dir to clean state"
+    git -C "$dir" reset --hard HEAD
+    git -C "$dir" clean -fd
+  fi
+}
+reset_checkout "$PDFIUM_DIR"
+reset_checkout "$PDFIUM_DIR/build"
 
 apply_patches() {
   local label="$1" dir="$2"
@@ -31,9 +47,25 @@ apply_patches() {
     return
   fi
   for patch in "${patches[@]}"; do
-    echo ">>> applying $label/$(basename "$patch")"
-    git apply --check "$patch"
-    git apply "$patch"
+    # Optional `# Apply-from: <subdir>` header tells us which checkout
+    # the patch targets (relative to PDFIUM_DIR). Default: PDFIUM_DIR itself.
+    local apply_from
+    apply_from="$(grep -m1 -oE '^# Apply-from: [a-zA-Z0-9_/.-]+' "$patch" | awk '{print $3}' || true)"
+    local apply_dir="$PDFIUM_DIR"
+    [ -n "$apply_from" ] && apply_dir="$PDFIUM_DIR/$apply_from"
+
+    if [ ! -d "$apply_dir" ]; then
+      echo "error: patch $(basename "$patch") wants Apply-from=$apply_from but $apply_dir is missing" >&2
+      exit 1
+    fi
+
+    local abs_patch
+    abs_patch="$(cd "$(dirname "$patch")" && pwd)/$(basename "$patch")"
+    local tag="$label/$(basename "$patch")"
+    [ -n "$apply_from" ] && tag="$tag (in $apply_from/)"
+    echo ">>> applying $tag"
+    ( cd "$apply_dir" && git apply --check "$abs_patch" )
+    ( cd "$apply_dir" && git apply "$abs_patch" )
   done
 }
 

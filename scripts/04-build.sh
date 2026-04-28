@@ -9,14 +9,16 @@
 #     VERSION                   # one line: <pdfium-tag>+rejeb.<patches-rev>
 #     include/                  # all public/*.h plus public/cpp/*.h plus our fpdf_rejeb.h
 #     lib/libpdfium.dylib       # macOS
-#     lib/libpdfium.so          # Linux
+#     lib/libpdfium.so          # Linux, Android (per ABI)
 #     bin/pdfium.dll            # Windows runtime DLL
 #     lib/pdfium.dll.lib        # Windows import library
 #
 # Smoke test: links a tiny C program against the built library and
 # either verifies the runtime can load it (Unix) or just confirms
-# FPDF_InitLibrary is in the export table (Windows). Linker / missing-
-# symbol failure = build regression.
+# FPDF_InitLibrary is in the export table (Windows). Cross-compiled
+# targets (android-*) skip the runtime-load step — the linux runner
+# can't execute an arm64-android .so — but still nm-check that every
+# declared FPDFRejeb_* symbol made it into the .so.
 set -euo pipefail
 
 ROOT="${PDFIUM_PATCHED_ROOT:-$(pwd)}"
@@ -24,7 +26,7 @@ PDFIUM_DIR="$ROOT/pdfium/pdfium"
 
 TARGET="${1:-}"
 if [ -z "$TARGET" ]; then
-  echo "usage: $0 <mac-arm64|mac-x64|linux-x64|win-x64>" >&2
+  echo "usage: $0 <mac-arm64|mac-x64|linux-x64|win-x64|android-arm|android-arm64|android-x86|android-x64>" >&2
   exit 1
 fi
 
@@ -53,7 +55,7 @@ case "$TARGET" in
     cp "$OUT_DIR/libpdfium.dylib" "$DIST_DIR/lib/libpdfium.dylib"
     LIB_PATH="$DIST_DIR/lib/libpdfium.dylib"
     ;;
-  linux-*)
+  linux-*|android-*)
     cp "$OUT_DIR/libpdfium.so" "$DIST_DIR/lib/libpdfium.so"
     LIB_PATH="$DIST_DIR/lib/libpdfium.so"
     ;;
@@ -108,7 +110,7 @@ sym_exported() {
 # FPDF_InitLibrary is upstream's; always must be exported.
 SYMBOL_CHECK_OK=0
 case "$TARGET" in
-  mac-*|linux-*)
+  mac-*|linux-*|android-*)
     sym_exported "$LIB_PATH" "FPDF_InitLibrary" && SYMBOL_CHECK_OK=1
     ;;
   win-*)
@@ -133,7 +135,7 @@ DECL_SYMS="$(grep -oE 'FPDFRejeb_[A-Za-z_]+' "$ROOT/include/fpdf_rejeb.h" | sort
 if [ -n "$DECL_SYMS" ]; then
   for sym in $DECL_SYMS; do
     case "$TARGET" in
-      mac-*|linux-*)
+      mac-*|linux-*|android-*)
         if ! sym_exported "$LIB_PATH" "$sym"; then
           echo "FAIL: declared symbol $sym not exported by $LIB_PATH" >&2
           # Dump diagnostics so the next CI failure tells us what's actually
@@ -197,6 +199,13 @@ if [ -f "$SMOKE_SRC" ]; then
     win-*)
       # MSVC compile is awkward from bash; defer to CI's run-smoke step.
       echo ">>> skipping runtime smoke on Windows (handled by CI workflow)"
+      ;;
+    android-*)
+      # Cross-compiled .so — can't be loaded on the linux x86_64 runner.
+      # nm-based symbol checks above are the only enforcement we can do
+      # without an emulator. Real device load happens in downstream
+      # consumers (Annodoc Android sample).
+      echo ">>> skipping runtime smoke for $TARGET (cross-compiled — nm-only verification)"
       ;;
   esac
 fi

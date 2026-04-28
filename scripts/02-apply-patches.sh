@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 02-apply-patches.sh — reset PDFium to clean upstream state, apply
-# infra/ patches (always), then patches/ feature patches in lexical
+# 02-apply-patches.sh [target] — reset PDFium to clean upstream state,
+# apply infra/ patches (always), then patches/ feature patches in lexical
 # order. Finally, copy our public header into PDFium's public/ dir.
 #
 # Patches are applied from $PDFIUM_DIR by default. A patch can opt into
@@ -11,12 +11,21 @@
 #
 # The android infra patch uses this to land in pdfium/build/.
 #
+# A patch can also declare itself incompatible with one or more targets:
+#
+#   # Skip-for-target: wasm,foo
+#
+# When the optional |target| argument matches any value in the list,
+# the patch is silently skipped. The shared_library infra patch uses
+# this to opt out of the wasm build (em++ links from a static .a).
+#
 # Idempotent: re-running is safe but destroys any manual edits inside
 # pdfium/pdfium/ (and the listed sub-checkouts) via git reset --hard.
 set -euo pipefail
 
 ROOT="${PDFIUM_PATCHED_ROOT:-$(pwd)}"
 PDFIUM_DIR="$ROOT/pdfium/pdfium"
+TARGET="${1:-}"
 
 if [ ! -d "$PDFIUM_DIR" ]; then
   echo "error: $PDFIUM_DIR does not exist — run scripts/01-fetch-pdfium.sh first" >&2
@@ -47,6 +56,18 @@ apply_patches() {
     return
   fi
   for patch in "${patches[@]}"; do
+    # Optional `# Skip-for-target: <t1,t2,...>` header opts the patch
+    # out of specific targets. Anchored to end-of-line for the same
+    # reason as Apply-from below.
+    local skip_for
+    skip_for="$(grep -m1 -oE '^# Skip-for-target: [a-zA-Z0-9_,/.-]+$' "$patch" \
+                | sed 's/^# Skip-for-target: //' || true)"
+    if [ -n "$skip_for" ] && [ -n "$TARGET" ] \
+       && echo ",$skip_for," | grep -q ",$TARGET,"; then
+      echo ">>> skipping $label/$(basename "$patch") (Skip-for-target: $skip_for matches $TARGET)"
+      continue
+    fi
+
     # Optional `# Apply-from: <subdir>` header tells us which checkout
     # the patch targets (relative to PDFIUM_DIR). Default: PDFIUM_DIR itself.
     # Anchor to end-of-line so we don't pick up literal "Apply-from:"

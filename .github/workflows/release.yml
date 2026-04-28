@@ -118,7 +118,7 @@ jobs:
 
       - name: Apply patches
         shell: bash
-        run: ./scripts/02-apply-patches.sh
+        run: ./scripts/02-apply-patches.sh ${{ matrix.target }}
 
       - name: Configure
         shell: bash

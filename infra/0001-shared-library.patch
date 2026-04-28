@@ -1,13 +1,23 @@
-# Build infrastructure patch (always applied; not counted in PATCHES_VERSION).
+# Build infrastructure patch (applied to native targets; not counted in
+# PATCHES_VERSION).
 #
 # Convert PDFium's `pdfium` target from `component()` (which becomes
 # static_library when is_component_build = false) into an explicit
 # `shared_library`, so that ninja produces libpdfium.{dylib|so|dll}
 # rather than a static archive.
 #
+# Skipped on wasm: emscripten owns the link from libpdfium.a via em++,
+# so the target must stay a static library. Forcing shared_library here
+# also makes gn flag the (now-unused) `static_component_type` assignment
+# inside the target body as a dead-store error during gn gen. The
+# Skip-for-target header below tells 02-apply-patches.sh to drop this
+# patch when the target is `wasm`.
+#
 # Source: bblanchon/pdfium-binaries patches/shared_library.patch (BSD-3-Clause).
 #         The Windows resources.rc lines from upstream are intentionally
 #         omitted — we don't ship Windows DLL metadata.
+#
+# Skip-for-target: wasm
 diff --git a/BUILD.gn b/BUILD.gn
 index 62210c2f6..053fbff6d 100644
 --- a/BUILD.gn

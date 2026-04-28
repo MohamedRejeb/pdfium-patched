@@ -49,8 +49,10 @@ apply_patches() {
   for patch in "${patches[@]}"; do
     # Optional `# Apply-from: <subdir>` header tells us which checkout
     # the patch targets (relative to PDFIUM_DIR). Default: PDFIUM_DIR itself.
+    # Anchor to end-of-line so we don't pick up literal "Apply-from:"
+    # phrases buried in surrounding prose comments.
     local apply_from
-    apply_from="$(grep -m1 -oE '^# Apply-from: [a-zA-Z0-9_/.-]+' "$patch" | awk '{print $3}' || true)"
+    apply_from="$(grep -m1 -oE '^# Apply-from: [a-zA-Z0-9_/.-]+$' "$patch" | awk '{print $3}' || true)"
     local apply_dir="$PDFIUM_DIR"
     [ -n "$apply_from" ] && apply_dir="$PDFIUM_DIR/$apply_from"
 

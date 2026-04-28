@@ -10,9 +10,9 @@
 # JNI but resolves the FPDF symbols by name, not via JNI_OnLoad).
 #
 # The patch lives in the //build/ checkout (a separate gclient-managed
-# git repo inside pdfium/), not in pdfium/ proper, so it carries an
-# Apply-from: marker that 02-apply-patches.sh uses to cd into the right
-# directory before `git apply`.
+# git repo inside pdfium/), not in pdfium/ proper, so it carries the
+# directory hint header below; 02-apply-patches.sh reads it to cd into
+# the right tree before `git apply`.
 #
 # Source: bblanchon/pdfium-binaries patches/android/build.patch
 # (BSD-3-Clause). Vendored verbatim.

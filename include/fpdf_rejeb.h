@@ -270,6 +270,111 @@ FPDFRejeb_TextObjGetGlyphPathAt(FPDF_PAGEOBJECT text_obj,
                                 int index,
                                 float font_size);
 
+// Returns which kind of pattern (if any) is used for |path_obj|'s fill:
+//   0 = no pattern (solid colour, no fill, or default state)
+//   1 = tiling pattern   (CPDF_TilingPattern — repeating tile)
+//   2 = shading pattern  (CPDF_ShadingPattern — gradient/function fill)
+//
+// Returns -1 on null |path_obj| or non-path page object.
+//
+// Lets a downstream renderer decide whether the path can be drawn via the
+// vector chain (kind 0) or needs to fall back to FPDFRejeb_PathObjGetRenderedBitmap
+// (kind 1 or 2). PDFium's CPDF_Pattern doesn't expose a public type
+// discriminator at 7811, so this export wraps the AsTilingPattern() /
+// AsShadingPattern() virtual-cast pair.
+//
+// Backed by patches/0009-export-pathobj-pattern-and-type3.patch.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_PathObjGetFillPatternKind(FPDF_PAGEOBJECT path_obj);
+
+// Renders only |path_obj| into a fresh FPDF_BITMAP, scaled by |scale|. The
+// returned bitmap covers the path's page-space bounding box rounded outward
+// to whole pixels. Caller takes ownership and MUST release with
+// FPDFBitmap_Destroy.
+//
+// Mirrors upstream FPDFTextObj_GetRenderedBitmap step-for-step but for a
+// path object — uses the same CPDF_RenderStatus::RenderSingleObject path.
+// Routes pattern / shading / image-resource lookups through the page's
+// resource dictionary, so pattern fills resolve correctly. Pass NULL for
+// |page| only if the path object is detached from any page (rare).
+//
+// Returns NULL on: null |document|, null |path_obj|, page that doesn't
+// belong to |document|, scale <= 0, empty bbox, or bitmap allocation
+// failure.
+//
+// Use case: downstream callers fall back to this rasteriser when
+// FPDFRejeb_PathObjGetFillPatternKind reports a pattern (kind 1 or 2)
+// that the vector chain can't reproduce — single-object rasterisation
+// avoids re-rendering the whole page just to grab one pattern-filled path.
+//
+// Backed by patches/0009-export-pathobj-pattern-and-type3.patch.
+FPDF_EXPORT FPDF_BITMAP FPDF_CALLCONV
+FPDFRejeb_PathObjGetRenderedBitmap(FPDF_DOCUMENT document,
+                                   FPDF_PAGE page,
+                                   FPDF_PAGEOBJECT path_obj,
+                                   float scale);
+
+// Type 3 procedural-glyph vector enumeration. The three exports below let
+// callers walk the page-object content of a Type 3 font's per-char glyph
+// procedure — recovering the vector geometry that FPDFRejeb_TextGetGlyphPath
+// (patch 0004) and FPDFRejeb_TextObjGetGlyphPathAt (patch 0008) bail on
+// for Type 3 fonts (their glyphs are content streams, not outlines).
+//
+// Recovery flow for a single Type 3 char at index i of |text_obj|:
+//   1. count = FPDFRejeb_TextObjGetType3CharObjectCount(text_obj, i)
+//      Bail if -1 (not Type 3, or no glyph for the char).
+//   2. for j in 0..count: obj = FPDFRejeb_TextObjGetType3CharObjectAt(text_obj, i, j)
+//      Use upstream FPDFPageObj_GetType / FPDFPath_* / etc. on each |obj|.
+//   3. font_matrix = FPDFRejeb_TextObjGetType3FontMatrix(text_obj, ...)
+//      Compose with the text-object matrix (from FPDFTextObj_GetMatrix)
+//      to map per-glyph form-space geometry into page space.
+//
+// The returned page objects are owned by the font (which is owned by the
+// document) — do NOT call FPDFPageObj_Destroy on them. Lifetime is tied
+// to the document.
+
+// Returns the number of page objects in the Type 3 char's glyph procedure
+// for char |char_index| of |text_obj|. Returns -1 on null / non-text /
+// non-Type-3 / out-of-range / sentinel charcode / no-glyph-loaded. Returns
+// 0 only if the glyph procedure exists but is empty (rare — usually the
+// font would not declare the glyph).
+//
+// Backed by patches/0009-export-pathobj-pattern-and-type3.patch.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_TextObjGetType3CharObjectCount(FPDF_PAGEOBJECT text_obj,
+                                         int char_index);
+
+// Returns the |obj_index|-th page object in the Type 3 char's glyph procedure
+// (use FPDFRejeb_TextObjGetType3CharObjectCount to learn the upper bound).
+// Returns NULL on out-of-range, non-Type-3, etc. The returned page object
+// is owned by the font; do NOT FPDFPageObj_Destroy it.
+//
+// Backed by patches/0009-export-pathobj-pattern-and-type3.patch.
+FPDF_EXPORT FPDF_PAGEOBJECT FPDF_CALLCONV
+FPDFRejeb_TextObjGetType3CharObjectAt(FPDF_PAGEOBJECT text_obj,
+                                      int char_index,
+                                      int obj_index);
+
+// Writes the 6 components of the Type 3 font's per-glyph matrix
+// (CPDF_Type3Font::GetFontMatrix) into the out-params. The matrix maps the
+// font's per-glyph unit space (typically /FontBBox normalised to 1/1000
+// units) into the font's text space — callers walking the per-char form
+// objects need to compose this with the text-object matrix to land their
+// extracted geometry in page space.
+//
+// Returns FPDF_FALSE on any null arg or non-text / non-Type-3 |text_obj|.
+// On FPDF_FALSE the out-params are unchanged.
+//
+// Backed by patches/0009-export-pathobj-pattern-and-type3.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_TextObjGetType3FontMatrix(FPDF_PAGEOBJECT text_obj,
+                                    float* out_a,
+                                    float* out_b,
+                                    float* out_c,
+                                    float* out_d,
+                                    float* out_e,
+                                    float* out_f);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

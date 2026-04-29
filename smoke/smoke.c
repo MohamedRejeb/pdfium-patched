@@ -60,6 +60,14 @@ int main(void) {
     (void)FPDFRejeb_TextObjGetCharPosAt(NULL, 0, &pos_x, &pos_y);
     (void)FPDFRejeb_TextObjGetGlyphPathAt(NULL, 0, 0.0f);
   }
+  {
+    float a = 0.0f, b = 0.0f, c = 0.0f, d = 0.0f, e = 0.0f, f = 0.0f;
+    (void)FPDFRejeb_PathObjGetFillPatternKind(NULL);
+    (void)FPDFRejeb_PathObjGetRenderedBitmap(NULL, NULL, NULL, 1.0f);
+    (void)FPDFRejeb_TextObjGetType3CharObjectCount(NULL, 0);
+    (void)FPDFRejeb_TextObjGetType3CharObjectAt(NULL, 0, 0);
+    (void)FPDFRejeb_TextObjGetType3FontMatrix(NULL, &a, &b, &c, &d, &e, &f);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

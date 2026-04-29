@@ -1,0 +1,361 @@
+# Feature patch 0009 — pattern-fill rasterisation + Type 3 procedural
+# vector enumeration. Two unrelated capabilities, five new exports:
+#
+# Group A — pattern-fill rasterisation (path objects only):
+#
+#   FPDFRejeb_PathObjGetFillPatternKind(path_obj)
+#       → 0 = no pattern (solid colour or no fill), 1 = tiling, 2 = shading.
+#       Returns -1 on null / non-path object. Discriminates via the virtual
+#       CPDF_Pattern::AsTilingPattern() / AsShadingPattern() accessors —
+#       PDFium 7811's CPDF_Pattern has no public GetType() method.
+#
+#   FPDFRejeb_PathObjGetRenderedBitmap(document, page, path_obj, scale)
+#       → FPDF_BITMAP of just this path object, scale-multiplied. Caller
+#       owns the bitmap (release with FPDFBitmap_Destroy). Returns NULL on
+#       null doc/path, mismatched page document, scale<=0, empty bbox, or
+#       allocation failure. Uses the same render-context plumbing pattern
+#       upstream uses for FPDFTextObj_GetRenderedBitmap — RenderSingleObject
+#       on the path with a flip-and-translate matrix to land it in our
+#       throwaway CFX_DefaultRenderDevice. The render context routes through
+#       the page resources so pattern dictionaries resolve correctly.
+#
+#       Why the path layer needs this when text already has it: text
+#       glyphs round-trip cleanly through FPDFFont_GetGlyphPath, but path
+#       fills with /Pattern resources don't have a vector path equivalent
+#       — the pattern's tile (CPDF_TilingPattern) or shading function
+#       (CPDF_ShadingPattern) needs the full render pipeline to produce
+#       pixels. Single-object rasterise via this export is the escape
+#       hatch the downstream renderer uses when it sees PatternKind != 0.
+#
+# Group B — Type 3 procedural-glyph vector enumeration (text objects only):
+#
+#   FPDFRejeb_TextObjGetType3CharObjectCount(text_obj, char_index)
+#       → number of CPDF_PageObject entries in the Type 3 char's form
+#       (== CPDF_Form::GetPageObjectCount()). Returns -1 on null, non-text,
+#       non-Type-3 font, sentinel charcode (0xFFFFFFFF), or out-of-range
+#       char_index, or if the font has no glyph procedure for the charcode.
+#
+#   FPDFRejeb_TextObjGetType3CharObjectAt(text_obj, char_index, obj_index)
+#       → FPDF_PAGEOBJECT for the obj_index-th page object in the Type 3
+#       char's form. Returns NULL on out-of-range, non-Type-3, etc. The
+#       returned page object is owned by the font (which is owned by the
+#       document) — do NOT call FPDFPageObj_Destroy on it, lifetime is
+#       tied to the document.
+#
+#   FPDFRejeb_TextObjGetType3FontMatrix(text_obj, *out_a..*out_f)
+#       → 6 components of CPDF_Type3Font::GetFontMatrix(). Maps per-glyph
+#       unit space (typically /FontBBox normalised to 1/1000 units) into
+#       the font's text space. Callers that walk the per-char form objects
+#       above need to compose this with the text-object matrix to land in
+#       page space. Returns false on null / non-text / non-Type-3.
+#
+#       Why the font matrix is exposed separately rather than baked into
+#       the per-char form objects: a Type 3 font is shared across all text
+#       objects that reference it, so the form objects are stored in
+#       font-local coordinates without per-instance scale. Callers compose
+#       (font_matrix * text_matrix) once and apply to every glyph's geometry.
+#
+# Why bundle Group A + Group B in one patch: both unblock the same
+# downstream renderer fallback path (single-object rasterise to FPDF_BITMAP
+# when the vector chain can't reproduce upstream's output) and both
+# require the same C++ surface — the page-object + render-pipeline
+# headers below would otherwise be pulled in by either patch alone.
+# Splitting would just duplicate the include churn.
+#
+# Type 3 form-object access route: CPDF_Type3Char::form() returns a
+# CPDF_Font::FormIface*; the patch downcasts to CPDF_Form*, which is the
+# only concrete impl AND inherits from CPDF_PageObjectHolder. PDFium 7811's
+# CPDF_Form is `final` (core/fpdfapi/page/cpdf_form.h:24) so the
+# static_cast is safe — guarded with a header comment so future PDFium
+# bumps don't silently regress to UB if a second FormIface impl appears.
+#
+# Adds two helpers in an unnamed namespace: AsPathObject() (mirrors the
+# existing AsTextObject from patch 0008) and GetType3CharForm() (factors
+# out the text -> Type3 -> LoadChar -> form chain shared by the two
+# Type-3 char-object accessors).
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index df86f60..8764a6d 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -2,22 +2,40 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <memory>
++#include <utility>
+ #include <vector>
+ 
+ #include "public/fpdf_rejeb.h"
+ 
+ #include "core/fpdfapi/font/cpdf_font.h"
++#include "core/fpdfapi/font/cpdf_type3char.h"
++#include "core/fpdfapi/font/cpdf_type3font.h"
++#include "core/fpdfapi/page/cpdf_color.h"
++#include "core/fpdfapi/page/cpdf_colorstate.h"
++#include "core/fpdfapi/page/cpdf_form.h"
+ #include "core/fpdfapi/page/cpdf_generalstate.h"
+ #include "core/fpdfapi/page/cpdf_occontext.h"
++#include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
++#include "core/fpdfapi/page/cpdf_pageobjectholder.h"
++#include "core/fpdfapi/page/cpdf_pathobject.h"
++#include "core/fpdfapi/page/cpdf_pattern.h"
++#include "core/fpdfapi/page/cpdf_shadingpattern.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
++#include "core/fpdfapi/page/cpdf_tilingpattern.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/render/cpdf_pagerendercontext.h"
++#include "core/fpdfapi/render/cpdf_rendercontext.h"
++#include "core/fpdfapi/render/cpdf_renderstatus.h"
+ #include "core/fpdftext/cpdf_textpage.h"
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/retain_ptr.h"
++#include "core/fxge/cfx_defaultrenderdevice.h"
+ #include "core/fxge/cfx_font.h"
++#include "core/fxge/dib/cfx_dibitmap.h"
+ #include "core/fxge/dib/fx_dib.h"
+ #include "core/fxge/text_char_pos.h"
+ #include "fpdfsdk/cpdfsdk_helpers.h"
+@@ -373,3 +391,240 @@ FPDFRejeb_TextObjGetGlyphPathAt(FPDF_PAGEOBJECT text_obj,
+       cfx_font->LoadGlyphPath(pos[0].glyph_index_, pos[0].font_char_width_);
+   return reinterpret_cast<FPDF_GLYPHPATH>(path);
+ }
++
++// ============================================================================
++// Patch 0009 — pattern-fill rasterisation + Type 3 vector char enumeration.
++//
++// Two unrelated capabilities, but both unblock the same downstream renderer
++// fallback path (single-object rasterise to FPDF_BITMAP) when the vector
++// chain can't reproduce upstream's output. Bundled because the C++ surface
++// they pull in (pattern, Type 3 form objects, the render pipeline) is the
++// same — splitting would duplicate the include/header churn for marginal
++// benefit and the patches/ folder grows linearly with no clearer mapping.
++
++namespace {
++
++// Resolve an FPDF_PAGEOBJECT to a CPDF_PathObject*, returning nullptr if the
++// handle is not a path object. Mirrors AsTextObject above; used by the
++// FPDFRejeb_PathObj* exports so callers don't have to verify
++// FPDFPageObj_GetType() == FPDF_PAGEOBJ_PATH first.
++CPDF_PathObject* AsPathObject(FPDF_PAGEOBJECT page_object) {
++  if (!page_object) {
++    return nullptr;
++  }
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj || !obj->IsPath()) {
++    return nullptr;
++  }
++  return obj->AsPath();
++}
++
++// Resolve (text_obj, char_index) to the CPDF_Form* backing that Type 3 char's
++// glyph procedure, or nullptr if any step fails (non-text obj, out-of-range
++// index, sentinel charcode, non-Type-3 font, no glyph for charcode). Shared
++// by the two Type-3 char-object accessors below so the (text -> font -> Type3
++// cast -> LoadChar -> form -> CPDF_Form downcast) chain only lives once.
++//
++// Safety of the static_cast: PDFium 7811's CPDF_Form is the *only* concrete
++// CPDF_Font::FormIface implementation AND is declared `final` (verified at
++// core/fpdfapi/page/cpdf_form.h:24 — `class CPDF_Form final :
++// public CPDF_PageObjectHolder, public CPDF_Font::FormIface`). If upstream
++// ever adds a second impl, this cast becomes UB and a runtime check needs
++// to replace it.
++const CPDF_Form* GetType3CharForm(CPDF_TextObject* text, int char_index) {
++  if (!text || char_index < 0 ||
++      static_cast<size_t>(char_index) >= text->CharCount()) {
++    return nullptr;
++  }
++  uint32_t charcode = text->GetCharCode(static_cast<size_t>(char_index));
++  if (charcode == 0xFFFFFFFFu) {
++    return nullptr;  // TJ-array number-adjustment slot, not a real glyph
++  }
++  RetainPtr<CPDF_Font> font = text->GetFont();
++  if (!font || !font->IsType3Font()) {
++    return nullptr;
++  }
++  CPDF_Type3Font* t3 = font->AsType3Font();
++  if (!t3) {
++    return nullptr;
++  }
++  CPDF_Type3Char* glyph = t3->LoadChar(charcode);
++  if (!glyph) {
++    return nullptr;
++  }
++  return static_cast<const CPDF_Form*>(glyph->form());
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_PathObjGetFillPatternKind(FPDF_PAGEOBJECT path_obj) {
++  CPDF_PathObject* path = AsPathObject(path_obj);
++  if (!path) {
++    return -1;
++  }
++  const CPDF_Color* fill_color = path->color_state().GetFillColor();
++  if (!fill_color || !fill_color->IsPattern()) {
++    return 0;  // No pattern fill (solid color, default state, etc.)
++  }
++  RetainPtr<CPDF_Pattern> pattern = fill_color->GetPattern();
++  if (!pattern) {
++    return 0;  // IsPattern() lied (shouldn't happen, but fail soft)
++  }
++  // CPDF_Pattern doesn't expose a public GetType() — discriminate by which
++  // of the two virtual As<Kind>Pattern() accessors returns non-null. PDFium
++  // declares these in core/fpdfapi/page/cpdf_pattern.h with default
++  // nullptr returns; CPDF_TilingPattern / CPDF_ShadingPattern override.
++  if (pattern->AsTilingPattern()) {
++    return 1;  // Tiling
++  }
++  if (pattern->AsShadingPattern()) {
++    return 2;  // Shading
++  }
++  return 0;  // Unknown (future pattern subclass — should not happen at 7811)
++}
++
++FPDF_EXPORT FPDF_BITMAP FPDF_CALLCONV
++FPDFRejeb_PathObjGetRenderedBitmap(FPDF_DOCUMENT document,
++                                   FPDF_PAGE page,
++                                   FPDF_PAGEOBJECT path_obj,
++                                   float scale) {
++  // Mirrors FPDFTextObj_GetRenderedBitmap (fpdfsdk/fpdf_edittext.cpp:524)
++  // step-for-step, with a CPDF_PathObject* in place of CPDF_TextObject*.
++  // CPDF_RenderStatus::RenderSingleObject takes any CPDF_PageObject*, so
++  // the only thing that varies is the bbox source (path->GetRect() vs
++  // text->GetRect()) and the AsPathObject downcast.
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
++  if (!doc) {
++    return nullptr;
++  }
++  CPDF_Page* optional_page = CPDFPageFromFPDFPage(page);
++  if (optional_page && optional_page->GetDocument() != doc) {
++    return nullptr;
++  }
++  CPDF_PathObject* path = AsPathObject(path_obj);
++  if (!path) {
++    return nullptr;
++  }
++  if (scale <= 0) {
++    return nullptr;
++  }
++
++  const CFX_Matrix scale_matrix(scale, 0, 0, scale, 0, 0);
++  const CFX_FloatRect& path_rect = path->GetRect();
++  const CFX_FloatRect scaled_rect = scale_matrix.TransformRect(path_rect);
++
++  // `rect` has to use integer values. Round up as needed.
++  const FX_RECT rect = scaled_rect.GetOuterRect();
++  if (rect.IsEmpty()) {
++    return nullptr;
++  }
++
++  auto result_bitmap = pdfium::MakeRetain<CFX_DIBitmap>();
++  if (!result_bitmap->Create(rect.Width(), rect.Height(),
++                             FXDIB_Format::kBgra)) {
++    return nullptr;
++  }
++
++  // The render-context plumbing below is the same dance upstream uses:
++  // a fresh CPDF_PageRenderContext owned by the page (so resource lookups
++  // for patterns, shadings, fonts route through page resources), with a
++  // CFX_DefaultRenderDevice attached to our throwaway bitmap. The
++  // RenderContextClearer RAII guard restores the page's prior state
++  // even if we early-return.
++  auto render_context = std::make_unique<CPDF_PageRenderContext>();
++  CPDF_PageRenderContext* render_context_ptr = render_context.get();
++  CPDF_Page::RenderContextClearer clearer(optional_page);
++  if (optional_page) {
++    optional_page->SetRenderContext(std::move(render_context));
++  }
++
++  RetainPtr<CPDF_Dictionary> page_resources =
++      optional_page ? optional_page->GetMutablePageResources() : nullptr;
++
++  auto device = std::make_unique<CFX_DefaultRenderDevice>();
++  CFX_DefaultRenderDevice* device_ptr = device.get();
++  render_context_ptr->device_ = std::move(device);
++  render_context_ptr->context_ = std::make_unique<CPDF_RenderContext>(
++      doc, std::move(page_resources), /*pPageCache=*/nullptr);
++
++  device_ptr->Attach(result_bitmap);
++
++  CFX_Matrix device_matrix(rect.Width(), 0, 0, rect.Height(), 0, 0);
++  CPDF_RenderStatus status(render_context_ptr->context_.get(), device_ptr);
++  status.SetDeviceMatrix(device_matrix);
++  status.Initialize(nullptr, nullptr);
++
++  // Need to flip the rendering and also move it to fit within `result_bitmap`.
++  CFX_Matrix render_matrix(1, 0, 0, -1, -path_rect.left, path_rect.top);
++  render_matrix *= scale_matrix;
++  status.RenderSingleObject(path, render_matrix);
++
++  ValidateBitmapPremultiplyState(result_bitmap);
++
++  // Caller takes ownership.
++  return FPDFBitmapFromCFXDIBitmap(result_bitmap.Leak());
++}
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_TextObjGetType3CharObjectCount(FPDF_PAGEOBJECT text_obj,
++                                         int char_index) {
++  const CPDF_Form* form = GetType3CharForm(AsTextObject(text_obj), char_index);
++  if (!form) {
++    return -1;
++  }
++  return static_cast<int>(form->GetPageObjectCount());
++}
++
++FPDF_EXPORT FPDF_PAGEOBJECT FPDF_CALLCONV
++FPDFRejeb_TextObjGetType3CharObjectAt(FPDF_PAGEOBJECT text_obj,
++                                      int char_index,
++                                      int obj_index) {
++  const CPDF_Form* form = GetType3CharForm(AsTextObject(text_obj), char_index);
++  if (!form || obj_index < 0 ||
++      static_cast<size_t>(obj_index) >= form->GetPageObjectCount()) {
++    return nullptr;
++  }
++  // Returned page object is owned by the Type 3 char's form (which is owned
++  // by the font, which is owned by the document). Lifetime tied to document.
++  return FPDFPageObjectFromCPDFPageObject(
++      form->GetPageObjectByIndex(static_cast<size_t>(obj_index)));
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_TextObjGetType3FontMatrix(FPDF_PAGEOBJECT text_obj,
++                                    float* out_a,
++                                    float* out_b,
++                                    float* out_c,
++                                    float* out_d,
++                                    float* out_e,
++                                    float* out_f) {
++  if (!out_a || !out_b || !out_c || !out_d || !out_e || !out_f) {
++    return false;
++  }
++  CPDF_TextObject* text = AsTextObject(text_obj);
++  if (!text) {
++    return false;
++  }
++  RetainPtr<CPDF_Font> font = text->GetFont();
++  if (!font || !font->IsType3Font()) {
++    return false;
++  }
++  CPDF_Type3Font* t3 = font->AsType3Font();
++  if (!t3) {
++    return false;
++  }
++  // CFX_Matrix uses lowercase a..f public fields directly (no getters);
++  // see core/fxcrt/fx_coordinates.h:490+. Type 3 font matrix maps per-glyph
++  // unit space (typically /FontBBox normalised to 1/1000 units) into the
++  // font's text space — every non-text rendering of a Type 3 glyph needs
++  // it composed with the text-object matrix to land in page space.
++  const CFX_Matrix& m = t3->GetFontMatrix();
++  *out_a = m.a;
++  *out_b = m.b;
++  *out_c = m.c;
++  *out_d = m.d;
++  *out_e = m.e;
++  *out_f = m.f;
++  return true;
++}

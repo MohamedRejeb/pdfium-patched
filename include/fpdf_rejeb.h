@@ -192,6 +192,84 @@ FPDFRejeb_TextGetCharType(FPDF_TEXTPAGE text_page, int char_index);
 FPDF_EXPORT int FPDF_CALLCONV
 FPDFRejeb_PageObjGetBlendMode(FPDF_PAGEOBJECT page_object);
 
+// Per-text-object source-CID walk. The four FPDFRejeb_TextObj*At
+// accessors below let callers iterate the raw content-stream CID array
+// of a text page object — sidestepping the text-page layer entirely.
+//
+// Why bypass FPDFRejeb_TextGetGlyphPath (text-page layer): PDFium's
+// text page decomposes ligatures into PIECE chars and, for fonts with
+// a non-invertible ToUnicode CMap, synthesises PIECE entries with
+// char_code == 0xFFFFFFFF ("no source CID") — every such char then
+// hits .notdef at glyph lookup. Native PDFium renders correctly because
+// its text renderer walks the text object's own char_codes_ vector
+// directly, never going through the text page. These exports give
+// callers the same path.
+//
+// All four take an FPDF_PAGEOBJECT that the caller has already verified
+// is a text object via FPDFPageObj_GetType() == FPDF_PAGEOBJ_TEXT.
+// They internally re-validate (returning a sentinel on type mismatch)
+// so passing a non-text object is safe but useless.
+
+// Returns the number of CIDs in |text_obj|'s content-stream CID array
+// (== CPDF_TextObject::CharCount()). Returns -1 if |text_obj| is null
+// or not a text page object.
+//
+// Backed by patches/0008-export-textobj-cid-walk.patch.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_TextObjCountCharCodes(FPDF_PAGEOBJECT text_obj);
+
+// Returns the raw stream CID at |index| in |text_obj|. For CIDFonts this
+// is the multi-byte CID; for simple fonts it's the 1-byte code (same
+// kind of value FPDFRejeb_TextObjGetCharCodes returns, just per-index).
+//
+// Returns 0xFFFFFFFF on null/non-text |text_obj|, on negative |index|,
+// on out-of-range |index|, AND for legitimate TJ-array number-adjustment
+// slots (PDFium stores them inline in char_codes_ as 0xFFFFFFFF — they
+// represent in-line position tweaks, not real glyphs). Callers should
+// filter on this single sentinel value either way.
+//
+// Backed by patches/0008-export-textobj-cid-walk.patch.
+FPDF_EXPORT uint32_t FPDF_CALLCONV
+FPDFRejeb_TextObjGetCharCodeAt(FPDF_PAGEOBJECT text_obj, int index);
+
+// Writes the page-space (post text-matrix) glyph origin for the CID at
+// |index| of |text_obj| into |out_x| and |out_y|. The coordinate system
+// matches FPDFTextObj_GetMatrix's output — same point any caller already
+// using upstream's text-object APIs is operating in.
+//
+// Returns FPDF_TRUE on success. Returns FPDF_FALSE (with |out_x|/|out_y|
+// unchanged) on null |text_obj|/out-params, non-text object, negative
+// or out-of-range |index|, OR when the CID at |index| is the 0xFFFFFFFF
+// TJ-array sentinel (no rendered position to report).
+//
+// Backed by patches/0008-export-textobj-cid-walk.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_TextObjGetCharPosAt(FPDF_PAGEOBJECT text_obj,
+                              int index,
+                              float* out_x,
+                              float* out_y);
+
+// Loads the glyph outline for the CID at |index| of |text_obj|, sized
+// to |font_size|. Mirrors FPDFRejeb_TextGetGlyphPath (patch 0004) —
+// same GetCharPosList → LoadGlyphPath chain so fallback-font glyphs
+// resolve correctly — but skips the lossy text-page round-trip, so it
+// works for CIDs that the text-page layer would expose as 0xFFFFFFFF.
+//
+// Returns NULL for: null/non-text |text_obj|, negative or out-of-range
+// |index|, TJ-array sentinel CID at |index|, Type 3 fonts (whose glyphs
+// are content streams not outlines), and char-pos lookup miss.
+//
+// The returned FPDF_GLYPHPATH is consumed by upstream
+// FPDFGlyphPath_CountGlyphSegments / FPDFGlyphPath_GetGlyphPathSegment
+// the same way as a path from FPDFFont_GetGlyphPath. Lifetime is tied
+// to the underlying font; do NOT use it after the document is closed.
+//
+// Backed by patches/0008-export-textobj-cid-walk.patch.
+FPDF_EXPORT FPDF_GLYPHPATH FPDF_CALLCONV
+FPDFRejeb_TextObjGetGlyphPathAt(FPDF_PAGEOBJECT text_obj,
+                                int index,
+                                float font_size);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

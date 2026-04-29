@@ -52,6 +52,14 @@ int main(void) {
     (void)FPDFRejeb_TextGetCharType(NULL, 0);
     (void)FPDFRejeb_PageObjGetBlendMode(NULL);
   }
+  {
+    float pos_x = 0.0f;
+    float pos_y = 0.0f;
+    (void)FPDFRejeb_TextObjCountCharCodes(NULL);
+    (void)FPDFRejeb_TextObjGetCharCodeAt(NULL, 0);
+    (void)FPDFRejeb_TextObjGetCharPosAt(NULL, 0, &pos_x, &pos_y);
+    (void)FPDFRejeb_TextObjGetGlyphPathAt(NULL, 0, 0.0f);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

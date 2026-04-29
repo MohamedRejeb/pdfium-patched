@@ -1,0 +1,170 @@
+# Feature patch 0008 — export per-text-obj CID walk: four
+# FPDFRejeb_TextObj*At exports keyed off FPDF_PAGEOBJECT (a text page
+# object), exposing the source content-stream CID array directly.
+#
+# Annodoc M2 follow-up. The existing patch 0004 (FPDFRejeb_TextGetGlyphPath)
+# operates at the text-page layer. PDFium's text page decomposes
+# ligatures into PIECE chars, and for fonts whose ToUnicode CMap is
+# non-invertible (one source CID maps to multiple unicodes) PDFium
+# synthesises PIECE entries with char_code == kInvalidCharCode
+# (0xFFFFFFFF) — "no source CID". Patch 0004 bails for those because
+# GlyphFromCharCode(0xFFFFFFFF) returns 0 and the resulting path is null.
+#
+# Native PDFium renders these correctly because CPDF_TextObject's render
+# path walks the text object's own char_codes_ vector — it never goes
+# through the text page. These exports give callers the same path.
+#
+# Concrete repro: large-pdf.pdf p07 title font ANDDPT+HacenMaghrebBd
+# has ~half its PIECE chars hit the 0xFFFFFFFF fallback under the
+# text-page accessor; walking via the text object directly preserves
+# the CIDs and lets the engine hand them straight to GlyphFromCharCode.
+#
+# Four exports (all take FPDF_PAGEOBJECT, validated via IsText):
+#
+#   FPDFRejeb_TextObjCountCharCodes(text_obj)
+#       → text->CharCount()  (length of char_codes_)
+#       Returns -1 on null / non-text object.
+#
+#   FPDFRejeb_TextObjGetCharCodeAt(text_obj, index)
+#       → text->GetCharCode(index)  (kInvalidCharCode for out-of-range)
+#       Returns 0xFFFFFFFF on null / non-text / negative index.
+#
+#   FPDFRejeb_TextObjGetCharPosAt(text_obj, index, *out_x, *out_y)
+#       → page-space glyph origin = GetTextMatrix().Transform(item.origin_)
+#       Returns false on null/out-of-range/sentinel charcode (TJ-array
+#       number-adjustment slots have charcode == 0xFFFFFFFF — no glyph).
+#       NOTE: PDFium 7811 does NOT expose CPDF_PageObject::matrix() (CTM)
+#       publicly, but GetTextMatrix() already lifts the per-char origin
+#       to page space — same coord system as FPDFTextObj_GetMatrix's
+#       output — so a single Transform suffices. (Earlier internal docs
+#       suggested a two-step `text_matrix * obj_matrix` chain; PDFium's
+#       own bbox computation at cpdf_textobject.cpp:312 confirms the
+#       single-Transform variant is correct.)
+#
+#   FPDFRejeb_TextObjGetGlyphPathAt(text_obj, index, font_size)
+#       → reuses patch 0004's GetCharPosList → LoadGlyphPath chain so
+#       fallback fonts work the same way. Bails on Type 3 fonts and on
+#       sentinel charcodes.
+#
+# Adds an internal AsTextObject() helper in an unnamed namespace to
+# avoid four copies of the null/!IsText/AsText() boilerplate. Reuses
+# every header already pulled in by patches 0001-0007 (cpdf_textobject.h,
+# cpdf_pageobject.h, cpdf_font.h, cfx_font.h, text_char_pos.h, retain_ptr.h).
+# No new #includes.
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index 749ec9a..df86f60 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -264,3 +264,112 @@ FPDFRejeb_PageObjGetBlendMode(FPDF_PAGEOBJECT page_object) {
+   }
+   return static_cast<int>(gs.GetBlendType());
+ }
++
++namespace {
++
++// Resolve an FPDF_PAGEOBJECT to a CPDF_TextObject*, returning nullptr if
++// the handle is not a text object. Used by the per-text-obj CID walk
++// exports (FPDFRejeb_TextObj*At) so the caller doesn't have to verify
++// FPDFPageObj_GetType() == FPDF_PAGEOBJ_TEXT first.
++CPDF_TextObject* AsTextObject(FPDF_PAGEOBJECT page_object) {
++  if (!page_object) {
++    return nullptr;
++  }
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj || !obj->IsText()) {
++    return nullptr;
++  }
++  return obj->AsText();
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_TextObjCountCharCodes(FPDF_PAGEOBJECT text_obj) {
++  CPDF_TextObject* text = AsTextObject(text_obj);
++  if (!text) {
++    return -1;
++  }
++  return static_cast<int>(text->CharCount());
++}
++
++FPDF_EXPORT uint32_t FPDF_CALLCONV
++FPDFRejeb_TextObjGetCharCodeAt(FPDF_PAGEOBJECT text_obj, int index) {
++  CPDF_TextObject* text = AsTextObject(text_obj);
++  if (!text || index < 0) {
++    return 0xFFFFFFFFu;
++  }
++  // CPDF_TextObject::GetCharCode already returns CPDF_Font::kInvalidCharCode
++  // (== 0xFFFFFFFF) for out-of-range indices, matching the in-stream TJ-array
++  // sentinel value — callers can filter on that single value either way.
++  return text->GetCharCode(static_cast<size_t>(index));
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_TextObjGetCharPosAt(FPDF_PAGEOBJECT text_obj,
++                              int index,
++                              float* out_x,
++                              float* out_y) {
++  if (!out_x || !out_y) {
++    return false;
++  }
++  CPDF_TextObject* text = AsTextObject(text_obj);
++  if (!text || index < 0 ||
++      static_cast<size_t>(index) >= text->CharCount()) {
++    return false;
++  }
++  CPDF_TextObject::Item info =
++      text->GetCharInfo(static_cast<size_t>(index));
++  // 0xFFFFFFFF in char_codes_ marks a TJ-array number-adjustment slot
++  // (a position tweak, not a real glyph) — no rendered position to report.
++  if (info.char_code_ == 0xFFFFFFFFu) {
++    return false;
++  }
++  // Item.origin_ is in pre-text-matrix object space; GetTextMatrix() lifts
++  // it to page space (the same coord system FPDFTextObj_GetMatrix exposes).
++  CFX_PointF origin = text->GetTextMatrix().Transform(info.origin_);
++  *out_x = origin.x;
++  *out_y = origin.y;
++  return true;
++}
++
++FPDF_EXPORT FPDF_GLYPHPATH FPDF_CALLCONV
++FPDFRejeb_TextObjGetGlyphPathAt(FPDF_PAGEOBJECT text_obj,
++                                int index,
++                                float font_size) {
++  CPDF_TextObject* text = AsTextObject(text_obj);
++  if (!text || index < 0 ||
++      static_cast<size_t>(index) >= text->CharCount()) {
++    return nullptr;
++  }
++  uint32_t charcode = text->GetCharCode(static_cast<size_t>(index));
++  if (charcode == 0xFFFFFFFFu) {
++    return nullptr;  // TJ-array number entry, no glyph
++  }
++  RetainPtr<CPDF_Font> font = text->GetFont();
++  if (!font || font->IsType3Font()) {
++    return nullptr;
++  }
++  // Same chain as FPDFRejeb_TextGetGlyphPath (patch 0004): resolve the
++  // (charcode, glyph_index, font_char_width) triple via GetCharPosList so
++  // fallback fonts work, then ask the resolved CFX_Font for the outline.
++  static constexpr float kCharCodePosition = 0;
++  std::vector<TextCharPos> pos = font->GetCharPosList(
++      pdfium::span_from_ref(charcode),
++      pdfium::span_from_ref(kCharCodePosition), font_size);
++  if (pos.empty()) {
++    return nullptr;
++  }
++  CFX_Font* cfx_font;
++  if (pos[0].fallback_font_position_ == -1) {
++    cfx_font = font->GetFont();
++  } else {
++    cfx_font = font->GetFontFallback(pos[0].fallback_font_position_);
++    if (!cfx_font) {
++      return nullptr;
++    }
++  }
++  const CFX_Path* path =
++      cfx_font->LoadGlyphPath(pos[0].glyph_index_, pos[0].font_char_width_);
++  return reinterpret_cast<FPDF_GLYPHPATH>(path);
++}

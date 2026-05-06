@@ -188,7 +188,13 @@ if [ "$SYMBOL_CHECK_OK" -ne 1 ]; then
 fi
 
 # Verify each FPDFRejeb_* symbol declared in our header is also exported.
-DECL_SYMS="$(grep -oE 'FPDFRejeb_[A-Za-z_]+' "$ROOT/include/fpdf_rejeb.h" | sort -u || true)"
+# Match `FPDFRejeb_<name>(` only — i.e. real function signatures. The naive
+# `[A-Za-z_]+` pattern also picks up doc-comment globs like
+# `FPDFRejeb_TextObj*At` (where the `*` ends the char class), and the smoke
+# step then asks the dylib to export a non-existent `FPDFRejeb_TextObj`
+# symbol. Trailing `(` is the exact distinguishing token between real
+# declarations and prose mentions in the header.
+DECL_SYMS="$(grep -oE 'FPDFRejeb_[A-Za-z0-9_]+\(' "$ROOT/include/fpdf_rejeb.h" | tr -d '(' | sort -u || true)"
 if [ -n "$DECL_SYMS" ]; then
   for sym in $DECL_SYMS; do
     case "$TARGET" in

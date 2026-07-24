@@ -1,0 +1,38 @@
+# Feature patch 0014 — reset a page object's content-stream assignment.
+#
+#   FPDFRejeb_PageObjResetContentStream(page_object)
+#       → detaches the object from the content stream it was parsed
+#         from and marks it dirty, so FPDFPage_GenerateContent()
+#         re-serializes it like a freshly created object. Combined
+#         with FPDFPage_RemoveObject + FPDFPage_InsertObject this
+#         lets a caller rebuild a page's paint order in exact
+#         page-object-list order — the only way to make new content
+#         paint BELOW loaded content, since new objects always land
+#         in an appended stream and loaded objects otherwise rejoin
+#         their original (earlier) stream.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+index 8764a6d..1d3bc31 100644
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -628,3 +628,20 @@ FPDFRejeb_TextObjGetType3FontMatrix(FPDF_PAGEOBJECT text_obj,
+   *out_f = m.f;
+   return true;
+ }
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_PageObjResetContentStream(FPDF_PAGEOBJECT page_object) {
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj) {
++    return false;
++  }
++  // The caller is expected to have detached the object from its page via
++  // FPDFPage_RemoveObject first — that inserts the object's old stream into
++  // the holder's dirty set (CPDF_PageObjectHolder::RemovePageObject), so
++  // the stale bytes get rewritten without it. Here we only forget the
++  // object's own stream assignment so the next FPDFPage_GenerateContent
++  // treats it like a freshly created object.
++  obj->SetContentStream(CPDF_PageObject::kNoContentStream);
++  obj->SetDirty(true);
++  return true;
++}

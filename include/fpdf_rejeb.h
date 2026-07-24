@@ -375,6 +375,27 @@ FPDFRejeb_TextObjGetType3FontMatrix(FPDF_PAGEOBJECT text_obj,
                                     float* out_e,
                                     float* out_f);
 
+// Detaches |page_object| from the content stream it was parsed out of and
+// marks it dirty, as if it were a freshly created object. Serialized paint
+// order is stream order first and page-object-list order only within a
+// stream, and FPDFPage_GenerateContent() writes stream-less objects into a
+// NEW stream appended after all existing ones — so without this call a
+// freshly inserted object can never paint BELOW loaded content: loaded
+// objects rejoin their original (earlier) stream even across
+// FPDFPage_RemoveObject / FPDFPage_InsertObject.
+//
+// Intended use: detach a loaded object with FPDFPage_RemoveObject (which
+// records its old stream as dirty so its bytes are rewritten without it),
+// call this, then FPDFPage_InsertObject it back at the desired list
+// position. Once every object of the page is stream-less, GenerateContent
+// serializes the whole page into one stream in exact list order.
+//
+// Returns FPDF_FALSE on a null |page_object|.
+//
+// Backed by patches/0014-export-pageobj-reset-content-stream.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_PageObjResetContentStream(FPDF_PAGEOBJECT page_object);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

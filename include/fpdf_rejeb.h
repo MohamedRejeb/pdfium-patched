@@ -396,6 +396,129 @@ FPDFRejeb_TextObjGetType3FontMatrix(FPDF_PAGEOBJECT text_obj,
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 FPDFRejeb_PageObjResetContentStream(FPDF_PAGEOBJECT page_object);
 
+// What FPDFPage_GenerateContent() would lose if it re-serialized an object.
+//
+// PDFium rewrites a content stream from its in-memory model, and that
+// model writes back less than it parsed. Every flag below names content
+// the generator drops or replaces, so a rewrite of the object's stream
+// changes how the page looks while text extraction stays identical.
+#define FPDFREJEB_REGENLOSS_FILL_COLORSPACE 0x0001
+#define FPDFREJEB_REGENLOSS_STROKE_COLORSPACE 0x0002
+#define FPDFREJEB_REGENLOSS_TEXT_SPACING 0x0004
+#define FPDFREJEB_REGENLOSS_INLINE_IMAGE 0x0008
+#define FPDFREJEB_REGENLOSS_SHADING 0x0010
+#define FPDFREJEB_REGENLOSS_TYPE3_TEXT 0x0020
+#define FPDFREJEB_REGENLOSS_TEXT_CLIP 0x0040
+#define FPDFREJEB_REGENLOSS_GRAPHICS_STATE 0x0080
+#define FPDFREJEB_REGENLOSS_MITER_LIMIT 0x0100
+#define FPDFREJEB_REGENLOSS_INLINE_FONT 0x0200
+
+// Returns the FPDFREJEB_REGENLOSS_* flags that apply to |page_object|, 0
+// when the generator writes it back faithfully, or -1 on a null
+// |page_object|. Inactive objects report 0: the generator skips them.
+//
+// A colour space flag is raised only when the object actually paints with
+// that colour (a stroked path, filled text, a stencil mask image, a form).
+// FILL/STROKE_COLORSPACE covers everything that is not DeviceRGB or
+// DeviceGray — DeviceCMYK, ICCBased, Separation, Pattern — all written
+// back as black. GRAPHICS_STATE covers ExtGState entries beyond alpha and
+// blend mode (soft mask, transfer function, overprint, ...).
+//
+// |page| is the page owning the object and is used to inspect the
+// ExtGState dictionaries the object references. Pass NULL to skip that
+// inspection; the flags are then a lower bound.
+//
+// Not reported, because PDFium keeps no readable record of them: flatness
+// (`i`) and rendering intent (`ri`) set by their own operators. Neither
+// changes how PDFium renders the page.
+//
+// Backed by patches/0016-export-pageobj-regen-loss-flags.patch.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_PageObjGetRegenLossFlags(FPDF_PAGE page, FPDF_PAGEOBJECT page_object);
+
+// Returns the index of the content stream |page_object| belongs to — its
+// position in the page's /Contents array, 0 for a single stream — or -1
+// for a null object or one that was never written to a stream.
+//
+// Backed by patches/0016-export-pageobj-regen-loss-flags.patch.
+FPDF_EXPORT int FPDF_CALLCONV
+FPDFRejeb_PageObjGetContentStream(FPDF_PAGEOBJECT page_object);
+
+// Removes loaded objects from |page| without rewriting anything else.
+//
+// FPDFPage_RemoveObject() makes FPDFPage_GenerateContent() re-serialize
+// the object's whole content stream, which loses whatever the generator
+// cannot write back (see FPDFREJEB_REGENLOSS_*). This call instead
+// overwrites the objects' own bytes with spaces inside the original stream
+// data, so every other byte of the page stays as it was:
+//   - an image painted with `Do`: its `/Name Do` operator. The graphics
+//     state set up around it (q, cm, clip, Q) paints nothing on its own.
+//   - any other object: the `q` ... `Q` pair around it, provided that
+//     pair paints nothing else.
+//
+// All or nothing: when one of the |count| objects cannot be erased this
+// way, FPDF_FALSE comes back and nothing has changed. That is the case
+// for an object that is not an active top-level object of |page| parsed
+// from a content stream, that has pending modifications, that shares its
+// `q` ... `Q` pair with other content (images excepted), or whose bytes
+// are not what was recorded when the page was parsed.
+//
+// On success the objects are deactivated — they stay in the page's object
+// list, so indices do not shift, but they no longer render and must not
+// be used further — and resources nothing references any more are dropped
+// from the page, which is what lets image data leave the saved file.
+//
+// Backed by patches/0017-erase-objects-in-place.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_PageEraseObjects(FPDF_PAGE page,
+                           const FPDF_PAGEOBJECT* page_objects,
+                           int count);
+
+// Moves the content stream holding |page_object| to the front of the
+// page's /Contents, so everything in it paints below the rest of the page.
+//
+// FPDFPage_GenerateContent() always appends new objects as a last stream,
+// which paints on top. Generating first and moving that stream afterwards
+// puts new content underneath the original page without re-serializing a
+// single original object.
+//
+// Returns FPDF_TRUE when the stream is at the front afterwards, including
+// when it already was. Returns FPDF_FALSE, changing nothing, when the
+// object has no stream yet, when the page has pending modifications (call
+// FPDFPage_GenerateContent() first), or when any content stream leaves
+// the transformation matrix changed for the next one — the moved stream
+// was written for the matrix in effect at the end of the page.
+//
+// Backed by patches/0018-export-move-content-stream-to-front.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_PageMoveObjectStreamToFront(FPDF_PAGE page,
+                                      FPDF_PAGEOBJECT page_object);
+
+// Applies the page-space transform |matrix| to a loaded object without
+// rewriting anything else — what FPDFPageObj_Transform() followed by
+// FPDFPageObj_TransformClipPath() does, minus the re-serialization of
+// the object's whole content stream.
+//
+// The transform is written as one `cm` right after the `q` of the
+// `q` ... `Q` pair around the object, so everything that pair sets up for
+// it moves along: its clip, its soft mask, whatever else. Requires that
+// pair to paint nothing but the object. An image that shares its pair
+// with other content gets a `q cm ... Q` of its own around its paint
+// operator instead; the clip in effect there stays where it is, so that
+// only happens while the moved image remains inside it.
+//
+// Returns FPDF_FALSE, changing nothing, when neither is possible, when
+// |matrix| or the matrix in effect around the object cannot be inverted,
+// when a soft mask set outside the pair would stay behind, or when the
+// object is not an active, unmodified top-level object of |page| parsed
+// from a content stream.
+//
+// Backed by patches/0020-transform-object-in-place.patch.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFRejeb_PageObjTransformInPlace(FPDF_PAGE page,
+                                  FPDF_PAGEOBJECT page_object,
+                                  const FS_MATRIX* matrix);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

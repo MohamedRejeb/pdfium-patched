@@ -74,12 +74,12 @@ Pick `mac-arm64 | mac-x64 | linux-x64 | win-x64` for the target argument. Output
 
 - **Naming:** all new exports prefixed `FPDFRejeb_` to stay out of upstream's namespace.
 - **One concept per patch:** patches apply in lexical order; bundling capabilities makes selective rebases impossible.
-- **Additive only:** new files only (`fpdfsdk/fpdf_rejeb.cpp`, `public/fpdf_rejeb.h`) plus a one-line addition to `fpdfsdk/BUILD.gn`. Do not modify upstream files.
+- **Additive by default:** new files only (`fpdfsdk/fpdf_rejeb.cpp`, `public/fpdf_rejeb.h`) plus a one-line addition to `fpdfsdk/BUILD.gn`. A patch modifies upstream files only where no export can do the job, and says why in its header: 0015 and 0019 fix losses in the content generator, 0017 makes the content parser record where each object sits in its stream.
 
 ### `infra/` vs `patches/`
 
 - [`infra/`](infra/) holds build-pipeline patches (always applied; not counted in `PATCHES_VERSION`) — vendored from `bblanchon/pdfium-binaries` for drop-in compatibility. Re-vendor on PDFium bumps if upstream drifts in the patched files. See [`infra/NOTICE`](infra/NOTICE).
-- [`patches/`](patches/) holds feature patches that bump `PATCHES_VERSION`. Each adds one `FPDFRejeb_*` capability.
+- [`patches/`](patches/) holds feature patches that bump `PATCHES_VERSION`. Each adds one `FPDFRejeb_*` capability or fixes one upstream defect.
 
 ## License
 

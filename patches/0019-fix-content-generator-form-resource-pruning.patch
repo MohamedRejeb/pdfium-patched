@@ -1,0 +1,110 @@
+# Fix patch 0019 — keep page resources that only nested content uses.
+#
+#   After writing a page, CPDF_PageContentGenerator drops every Font,
+#   XObject and ExtGState entry of the page's resources that no page
+#   object names. It only looks at top-level objects, while the content
+#   of a form XObject resolves the names its own resource dictionary
+#   lacks in the PAGE's resources, and so does every other piece of
+#   nested content. A page where a form paints `/Im1` from the page
+#   dictionary therefore lost that image on any
+#   FPDFPage_GenerateContent() that wrote something — adding one
+#   annotation was enough.
+#
+#   Resource usage is now recorded through nested forms as well. Counting
+#   a name the form resolves in its own dictionary only keeps an entry
+#   that might have gone, which is harmless. Nothing is dropped at all
+#   where content is in use that is only parsed when it is rendered, so
+#   that the names it uses are not known here: the glyphs of a Type 3
+#   font or the group of a soft mask without resources of their own, and
+#   tiling patterns.
+#
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -103,7 +103,75 @@
+   for (const auto& name : page_object->GetGraphicsResourceNames()) {
+     CHECK(!name.IsEmpty());
+     seen_resources["ExtGState"].insert(name);
++  }
++
++  // A form's content resolves the names its own resource dictionary lacks
++  // in the page's, so everything it paints with counts as in use here.
++  if (const CPDF_FormObject* form_object = page_object->AsForm()) {
++    for (const auto& nested_object : *form_object->form()) {
++      if (nested_object->IsActive()) {
++        RecordPageObjectResourceUsage(nested_object.get(), seen_resources);
++      }
++    }
++  }
++}
++
++bool HasOwnResources(const CPDF_Object* content) {
++  const CPDF_Dictionary* dict = content ? content->GetDict() : nullptr;
++  return dict && dict->KeyExist("Resources");
++}
++
++bool IsTilingPattern(const CPDF_Color* color) {
++  if (!color || !color->IsPattern()) {
++    return false;
++  }
++  RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
++  return pattern && pattern->AsTilingPattern();
++}
++
++// True when |page_object| paints with content that may have no resource
++// dictionary of its own — the glyphs of a Type 3 font, the group of a soft
++// mask, the cell of a tiling pattern. Such content resolves every name in
++// the page's resources, and which names it uses is only known once it has
++// been parsed, which happens when it is rendered.
++bool PaintsWithPageResourcesUnseen(const CPDF_PageObject* page_object,
++                                   const CPDF_Dictionary* resources) {
++  if (const CPDF_TextObject* text = page_object->AsText()) {
++    RetainPtr<CPDF_Font> font = text->GetFont();
++    if (font && font->IsType3Font() &&
++        !font->GetFontDict()->KeyExist("Resources")) {
++      return true;
++    }
+   }
++
++  const CPDF_ColorState& colors = page_object->color_state();
++  if (colors.HasRef() && (IsTilingPattern(colors.GetFillColor()) ||
++                          IsTilingPattern(colors.GetStrokeColor()))) {
++    return true;
++  }
++
++  RetainPtr<const CPDF_Dictionary> states =
++      resources ? resources->GetDictFor("ExtGState") : nullptr;
++  for (const ByteString& name : page_object->GetGraphicsResourceNames()) {
++    RetainPtr<const CPDF_Dictionary> state =
++        states ? states->GetDictFor(name.AsStringView()) : nullptr;
++    RetainPtr<const CPDF_Dictionary> mask =
++        state ? state->GetDictFor("SMask") : nullptr;
++    RetainPtr<const CPDF_Stream> group = mask ? mask->GetStreamFor("G") : nullptr;
++    if (group && !HasOwnResources(group.Get())) {
++      return true;
++    }
++  }
++
++  if (const CPDF_FormObject* form_object = page_object->AsForm()) {
++    for (const auto& nested_object : *form_object->form()) {
++      if (nested_object->IsActive() &&
++          PaintsWithPageResourcesUnseen(nested_object.get(), resources)) {
++        return true;
++      }
++    }
++  }
++  return false;
+ }
+ 
+ CPDF_PageObjectHolder::RemovedResourceMap RemoveUnusedResources(
+@@ -499,6 +567,10 @@
+   for (auto& page_object : page_objects_) {
+     if (!page_object->IsActive()) {
+       continue;
++    }
++    if (PaintsWithPageResourcesUnseen(page_object, resources.Get())) {
++      // What is in use cannot be told, so nothing is dropped.
++      return;
+     }
+     RecordPageObjectResourceUsage(page_object, seen_resources);
+   }

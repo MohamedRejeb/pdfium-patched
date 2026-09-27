@@ -68,6 +68,14 @@ int main(void) {
     (void)FPDFRejeb_TextObjGetType3CharObjectAt(NULL, 0, 0);
     (void)FPDFRejeb_TextObjGetType3FontMatrix(NULL, &a, &b, &c, &d, &e, &f);
   }
+  {
+    (void)FPDFRejeb_PageObjResetContentStream(NULL);
+    (void)FPDFRejeb_PageObjGetRegenLossFlags(NULL, NULL);
+    (void)FPDFRejeb_PageObjGetContentStream(NULL);
+    (void)FPDFRejeb_PageEraseObjects(NULL, NULL, 0);
+    (void)FPDFRejeb_PageMoveObjectStreamToFront(NULL, NULL);
+    (void)FPDFRejeb_PageObjTransformInPlace(NULL, NULL, NULL);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

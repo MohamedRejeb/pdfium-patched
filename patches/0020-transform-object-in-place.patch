@@ -1,0 +1,274 @@
+# Feature patch 0020 — move or resize a loaded object without a rewrite.
+#
+#   FPDFRejeb_PageObjTransformInPlace(page, page_object, matrix)
+#       → writes the transform as one `cm` right after the `q` of the
+#         `q` ... `Q` pair around the object (patch 0017 records it), so
+#         the object moves together with the clip and everything else
+#         that pair sets up for it, and no other byte of the stream
+#         changes. An image sharing its pair with other content gets a
+#         pair of its own around its paint operator instead.
+#
+#   FPDFPageObj_Transform() reaches the file only through a
+#   re-serialization of the object's whole content stream.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -2,14 +2,19 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <algorithm>
++#include <cmath>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <set>
++#include <sstream>
+ #include <utility>
+ #include <vector>
+ 
+ #include "public/fpdf_rejeb.h"
+ 
++#include "core/fpdfapi/edit/cpdf_contentstream_write_utils.h"
+ #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
+ #include "core/fpdfapi/edit/cpdf_pagecontentmanager.h"
+ #include "core/fpdfapi/font/cpdf_font.h"
+@@ -46,6 +51,8 @@
+ #include "core/fpdftext/cpdf_textpage.h"
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/data_vector.h"
++#include "core/fxcrt/fx_coordinates.h"
++#include "core/fxcrt/fx_string_wrappers.h"
+ #include "core/fxcrt/span.h"
+ #include "core/fxcrt/unowned_ptr.h"
+ #include "core/fxcrt/retain_ptr.h"
+@@ -1094,6 +1101,32 @@
+ bool IsEditableInPlace(const CPDF_Page* page, const CPDF_PageObject* obj) {
+   return obj && obj->IsActive() && !obj->IsDirty() &&
+          obj->GetContentStream() >= 0 && PageOwnsObject(page, obj);
++}
++
++// Moves every recorded position of |stream_index| at or past |position| by
++// |delta| bytes, after an edit changed the stream's length there.
++void ShiftSourceSpans(CPDF_Page* page,
++                      int32_t stream_index,
++                      size_t position,
++                      int64_t delta) {
++  const auto shift = [position, delta](uint32_t& value) {
++    if (value != 0 && value >= position) {
++      value = static_cast<uint32_t>(static_cast<int64_t>(value) + delta);
++    }
++  };
++  for (const auto& candidate : *page) {
++    if (candidate->GetContentStream() != stream_index) {
++      continue;
++    }
++    CPDF_PageObject::SourceSpan& span = candidate->mutable_source_span();
++    const bool has_group = span.has_group();
++    shift(span.operator_end);
++    shift(span.group_end);
++    if (has_group && span.group_begin >= position) {
++      span.group_begin =
++          static_cast<uint32_t>(static_cast<int64_t>(span.group_begin) + delta);
++    }
++  }
+ }
+ 
+ }  // namespace
+@@ -1233,4 +1266,193 @@
+     }
+   }
+   return true;
+-}
+\ No newline at end of file
++}
++namespace {
++
++// Also false for a matrix holding anything that is not a finite number.
++bool IsInvertible(const CFX_Matrix& matrix) {
++  const float determinant = matrix.a * matrix.d - matrix.b * matrix.c;
++  return std::isfinite(matrix.a) && std::isfinite(matrix.b) &&
++         std::isfinite(matrix.c) && std::isfinite(matrix.d) &&
++         std::isfinite(matrix.e) && std::isfinite(matrix.f) &&
++         std::isfinite(determinant) && determinant != 0.0f;
++}
++
++ByteString MatrixOperator(const CFX_Matrix& matrix) {
++  fxcrt::ostringstream buffer;
++  WriteMatrix(buffer, matrix) << " cm";
++  return ByteString(buffer);
++}
++
++// True when one of the ExtGStates applied to |obj| before its group opened
++// carries a soft mask. Such a mask is anchored where it was set and would
++// stay behind when the group's content moves.
++bool HasSoftMaskFromOutsideGroup(const CPDF_Page* page,
++                                 const CPDF_PageObject* obj) {
++  RetainPtr<const CPDF_Dictionary> resources = page->GetResources();
++  RetainPtr<const CPDF_Dictionary> states =
++      resources ? resources->GetDictFor("ExtGState") : nullptr;
++  if (!states) {
++    return false;
++  }
++  const pdfium::span<const ByteString> names = obj->GetGraphicsResourceNames();
++  const size_t outer =
++      std::min(names.size(), obj->source_span().group_outer_graphics_names);
++  for (const ByteString& name : names.first(outer)) {
++    RetainPtr<const CPDF_Dictionary> state =
++        states->GetDictFor(name.AsStringView());
++    RetainPtr<const CPDF_Object> mask =
++        state ? state->GetDirectObjectFor("SMask") : nullptr;
++    if (mask && !(mask->IsName() && mask->GetString() == "None")) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// A replacement for the bytes in |range| of stream data, and what the
++// object's recorded positions become once it is in.
++struct Splice {
++  ByteRange range;
++  ByteString bytes;
++  CPDF_PageObject::SourceSpan span;
++  bool moves_clip = false;
++};
++
++// Moves the object together with everything its own group sets up — its
++// clip included — by transforming the group as a whole, right after the
++// `q` that opens it. Nothing outside the group is in its scope.
++std::optional<Splice> TransformGroup(const CPDF_Page* page,
++                                     const CPDF_PageObject* obj,
++                                     pdfium::span<const uint8_t> data,
++                                     const CFX_Matrix& delta) {
++  const ByteRange group = FindGroup(data, obj);
++  const CFX_Matrix& group_ctm = obj->source_span().group_ctm;
++  if (group.empty() || !IsInvertible(group_ctm) ||
++      HasSoftMaskFromOutsideGroup(page, obj)) {
++    return std::nullopt;
++  }
++  // |delta| is in page space; inside the group it has to be expressed in
++  // the coordinates in effect there.
++  const CFX_Matrix local = group_ctm * delta * group_ctm.GetInverse();
++
++  Splice splice;
++  splice.range = {group.begin + 1, group.begin + 1};
++  splice.bytes = " " + MatrixOperator(local) + " ";
++  splice.span = obj->source_span();
++  const uint32_t added = static_cast<uint32_t>(splice.bytes.GetLength());
++  splice.span.group_end += added;
++  if (splice.span.operator_end != 0) {
++    splice.span.operator_end += added;
++  }
++  splice.moves_clip = true;
++  return splice;
++}
++
++// For an image that shares its group with other content: wraps just its
++// own paint operator. The clip in effect there cannot move along, so this
++// is only exact while the image stays inside it.
++std::optional<Splice> TransformPaintOperator(const CPDF_PageObject* obj,
++                                             pdfium::span<const uint8_t> data,
++                                             const CFX_Matrix& delta) {
++  const CPDF_ImageObject* image = obj->AsImage();
++  if (!image) {
++    return std::nullopt;
++  }
++  const ByteRange paint = FindPaintOperator(
++      data, obj->source_span().operator_end, obj->GetResourceName());
++  const CFX_Matrix& matrix = image->matrix();
++  if (paint.empty() || !IsInvertible(matrix) ||
++      obj->general_state().GetSoftMask()) {
++    return std::nullopt;
++  }
++  const CPDF_PageObject::SourceSpan& span = obj->source_span();
++  if (span.clipped) {
++    const CFX_FloatRect moved =
++        (matrix * delta).TransformRect(CFX_FloatRect(0, 0, 1, 1));
++    if (!span.clip_is_rectangles || !span.clip_box.Contains(moved)) {
++      return std::nullopt;
++    }
++  }
++  const CFX_Matrix local = matrix * delta * matrix.GetInverse();
++  const ByteString opening = "q " + MatrixOperator(local) + " ";
++  const ByteString painting(
++      ByteStringView(data.subspan(paint.begin, paint.end - paint.begin)));
++
++  Splice splice;
++  splice.range = paint;
++  splice.bytes = opening + painting + " Q";
++  const uint32_t begin = static_cast<uint32_t>(paint.begin);
++  splice.span.group_begin = begin;
++  splice.span.group_end =
++      begin + static_cast<uint32_t>(splice.bytes.GetLength());
++  splice.span.operator_end =
++      begin + static_cast<uint32_t>(opening.GetLength() + painting.GetLength());
++  splice.span.group_ctm = matrix;
++  splice.span.group_outer_graphics_names =
++      obj->GetGraphicsResourceNames().size();
++  splice.span.clipped = span.clipped;
++  splice.span.clip_is_rectangles = span.clip_is_rectangles;
++  splice.span.clip_box = span.clip_box;
++  return splice;
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_PageObjTransformInPlace(FPDF_PAGE page,
++                                  FPDF_PAGEOBJECT page_object,
++                                  const FS_MATRIX* matrix) {
++  CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!cpage || !matrix || !IsEditableInPlace(cpage, obj)) {
++    return false;
++  }
++  const CFX_Matrix delta = CFXMatrixFromFSMatrix(*matrix);
++  if (!IsInvertible(delta)) {
++    return false;
++  }
++  const int32_t stream_index = obj->GetContentStream();
++  ContentStreamEdits edits(cpage);
++  DataVector<uint8_t>* data = edits.DataOf(stream_index);
++  if (!data) {
++    return false;
++  }
++
++  std::optional<Splice> splice = TransformGroup(cpage, obj, *data, delta);
++  if (!splice) {
++    splice = TransformPaintOperator(obj, *data, delta);
++  }
++  if (!splice) {
++    return false;
++  }
++
++  const pdfium::span<const uint8_t> bytes = splice->bytes.unsigned_span();
++  DataVector<uint8_t> edited;
++  edited.reserve(data->size() + bytes.size());
++  edited.insert(edited.end(), data->begin(),
++                data->begin() + splice->range.begin);
++  edited.insert(edited.end(), bytes.begin(), bytes.end());
++  edited.insert(edited.end(), data->begin() + splice->range.end, data->end());
++  *data = std::move(edited);
++  if (!edits.Commit()) {
++    return false;
++  }
++
++  const int64_t growth =
++      static_cast<int64_t>(bytes.size()) -
++      static_cast<int64_t>(splice->range.end - splice->range.begin);
++  ShiftSourceSpans(cpage, stream_index, splice->range.end, growth);
++  obj->mutable_source_span() = splice->span;
++
++  // Keeps the loaded object in step with the bytes, then drops the dirty
++  // flags those setters raise: the stream already says what they would
++  // make the generator write.
++  obj->Transform(delta);
++  if (splice->moves_clip) {
++    obj->TransformClipPath(delta);
++  }
++  obj->SetDirty(false);
++  obj->SetMatrixDirty(false);
++  return true;
++}

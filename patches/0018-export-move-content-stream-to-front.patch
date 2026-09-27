@@ -1,0 +1,101 @@
+# Feature patch 0018 — paint new content below the page without a rewrite.
+#
+#   FPDFRejeb_PageMoveObjectStreamToFront(page, page_object)
+#       → moves the content stream holding the object to the front of
+#         the page's /Contents and renumbers the loaded objects to match.
+#
+#   FPDFPage_GenerateContent() appends new objects as a last stream,
+#   which paints on top. Patch 0014 worked around that by re-homing every
+#   loaded object into one regenerated stream, which sends the whole page
+#   through the lossy generator. Moving the freshly generated stream
+#   instead leaves every original byte untouched.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -11,6 +11,7 @@
+ #include "public/fpdf_rejeb.h"
+ 
+ #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
++#include "core/fpdfapi/edit/cpdf_pagecontentmanager.h"
+ #include "core/fpdfapi/font/cpdf_font.h"
+ #include "core/fpdfapi/font/cpdf_type3char.h"
+ #include "core/fpdfapi/font/cpdf_type3font.h"
+@@ -1160,4 +1161,76 @@
+   CPDF_PageContentGenerator generator(cpage);
+   generator.UpdateResourcesDict();
+   return true;
++}
++namespace {
++
++// True while something on the page still waits for
++// FPDFPage_GenerateContent(). Editing /Contents then would leave the
++// pending stream indices pointing at the wrong streams.
++bool HasPendingModifications(const CPDF_Page* page) {
++  if (page->HasDirtyStreams()) {
++    return true;
++  }
++  for (const auto& candidate : *page) {
++    if (candidate->IsDirty()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_PageMoveObjectStreamToFront(FPDF_PAGE page,
++                                      FPDF_PAGEOBJECT page_object) {
++  CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!cpage || !obj || !PageOwnsObject(cpage, obj)) {
++    return false;
++  }
++  const int32_t stream_index = obj->GetContentStream();
++  if (stream_index < 0) {
++    return false;
++  }
++  if (stream_index == 0) {
++    return true;
++  }
++  if (HasPendingModifications(cpage)) {
++    return false;
++  }
++
++  {
++    // Gives the page its own /Contents array first when it is shared.
++    CPDF_PageContentManager manager(cpage, cpage->GetDocument());
++  }
++  RetainPtr<CPDF_Array> contents =
++      cpage->GetMutableDict()->GetMutableArrayFor("Contents");
++  if (!contents || static_cast<size_t>(stream_index) >= contents->size()) {
++    return false;
++  }
++  for (size_t i = 0; i < contents->size(); ++i) {
++    if (!cpage->GetCTMAtEndOfStream(static_cast<int32_t>(i)).IsIdentity()) {
++      return false;
++    }
++  }
++  RetainPtr<const CPDF_Reference> reference =
++      ToReference(contents->GetObjectAt(static_cast<size_t>(stream_index)));
++  if (!reference) {
++    return false;
++  }
++  const uint32_t stream_object_number = reference->GetRefObjNum();
++  contents->RemoveAt(static_cast<size_t>(stream_index));
++  contents->InsertNewAt<CPDF_Reference>(0, cpage->GetDocument(),
++                                        stream_object_number);
++
++  for (const auto& candidate : *cpage) {
++    const int32_t current = candidate->GetContentStream();
++    if (current == stream_index) {
++      candidate->SetContentStream(0);
++    } else if (current >= 0 && current < stream_index) {
++      candidate->SetContentStream(current + 1);
++    }
++  }
++  return true;
+ }
+\ No newline at end of file

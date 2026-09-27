@@ -1,0 +1,62 @@
+# Fix patch 0015 — keep each text object on its own font when a content
+# stream is regenerated.
+#
+#   CPDF_PageContentGenerator::ProcessText resolves the font resource
+#   name through CPDF_PageObjectHolder's fonts map, keyed by
+#   (base font name, font type). Embedded simple fonts drop their subset
+#   tag on load (`BCDFEE+Dosis-Bold` → `Dosis-Bold`), so two subsets of
+#   one font on the same page collide: every text object of the second
+#   subset is rewritten to reference the first one, and the saved page
+#   shows missing or different glyphs. The same happens to any two font
+#   dictionaries sharing a BaseFont but differing in encoding.
+#
+#   The key now also carries the font dictionary's object number.
+#
+#   Exports no symbol. Unlike the other feature patches this one has to
+#   modify upstream files — the generator offers no hook to work around
+#   the lookup from fpdf_rejeb.cpp. Still present upstream at the time of
+#   writing; drop the patch once upstream keys the map by font identity.
+#
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+index aa3fede..c9d4343 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -969,6 +969,7 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+     return;
+   }
+   data.baseFont = font->GetBaseFontName();
++  data.fontDictObjNum = font->GetFontDictObjNum();
+ 
+   ByteString dict_name;
+   std::optional<ByteString> maybe_name = obj_holder_->FontsMapSearch(data);
+diff --git a/core/fpdfapi/page/cpdf_pageobjectholder.cpp b/core/fpdfapi/page/cpdf_pageobjectholder.cpp
+index 362b988..3132078 100644
+--- a/core/fpdfapi/page/cpdf_pageobjectholder.cpp
++++ b/core/fpdfapi/page/cpdf_pageobjectholder.cpp
+@@ -35,7 +35,10 @@ bool FontData::operator<(const FontData& other) const {
+   if (baseFont != other.baseFont) {
+     return baseFont < other.baseFont;
+   }
+-  return type < other.type;
++  if (type != other.type) {
++    return type < other.type;
++  }
++  return fontDictObjNum < other.fontDictObjNum;
+ }
+ 
+ CPDF_PageObjectHolder::CPDF_PageObjectHolder(
+diff --git a/core/fpdfapi/page/cpdf_pageobjectholder.h b/core/fpdfapi/page/cpdf_pageobjectholder.h
+index 7ca2bbf..540de1b 100644
+--- a/core/fpdfapi/page/cpdf_pageobjectholder.h
++++ b/core/fpdfapi/page/cpdf_pageobjectholder.h
+@@ -45,6 +45,10 @@ struct GraphicsData {
+ struct FontData {
+   ByteString baseFont;
+   ByteString type;
++  // Object number of the font dictionary, 0 for an inline one. Embedded
++  // simple fonts lose their subset tag on load, so several subsets of one
++  // font share `baseFont` and `type` while being different fonts.
++  uint32_t fontDictObjNum = 0;
+ 
+   bool operator<(const FontData& other) const;
+ };

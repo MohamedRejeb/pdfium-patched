@@ -1,0 +1,249 @@
+# Feature patch 0016 — report what a content-stream rewrite would lose.
+#
+#   FPDFRejeb_PageObjGetRegenLossFlags(page, page_object)
+#       → FPDFREJEB_REGENLOSS_* flags naming everything
+#         CPDF_PageContentGenerator drops or replaces when it
+#         re-serializes the object: colours outside DeviceRGB/Gray
+#         (written back as black), character and word spacing, inline
+#         images, shadings, Type 3 text, text clips, ExtGState entries
+#         beyond alpha and blend mode, a non-default miter limit, and
+#         inline font dictionaries.
+#   FPDFRejeb_PageObjGetContentStream(page_object)
+#       → index of the content stream holding the object.
+#
+#   Removing or transforming one loaded object makes the generator
+#   rewrite its whole stream, so a caller needs both answers for every
+#   object sharing that stream before it touches anything.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -15,6 +15,8 @@
+ #include "core/fpdfapi/page/cpdf_colorstate.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
+ #include "core/fpdfapi/page/cpdf_generalstate.h"
++#include "core/fpdfapi/page/cpdf_image.h"
++#include "core/fpdfapi/page/cpdf_imageobject.h"
+ #include "core/fpdfapi/page/cpdf_occontext.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/page/cpdf_pageobject.h"
+@@ -24,9 +26,12 @@
+ #include "core/fpdfapi/page/cpdf_shadingpattern.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
+ #include "core/fpdfapi/page/cpdf_tilingpattern.h"
++#include "core/fpdfapi/page/cpdf_transferfunc.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/parser/cpdf_name.h"
++#include "core/fpdfapi/parser/cpdf_stream.h"
+ #include "core/fpdfapi/render/cpdf_pagerendercontext.h"
+ #include "core/fpdfapi/render/cpdf_rendercontext.h"
+ #include "core/fpdfapi/render/cpdf_renderstatus.h"
+@@ -35,6 +40,7 @@
+ #include "core/fxcrt/retain_ptr.h"
+ #include "core/fxge/cfx_defaultrenderdevice.h"
+ #include "core/fxge/cfx_font.h"
++#include "core/fxge/cfx_graphstatedata.h"
+ #include "core/fxge/dib/cfx_dibitmap.h"
+ #include "core/fxge/dib/fx_dib.h"
+ #include "core/fxge/text_char_pos.h"
+@@ -644,4 +650,198 @@
+   obj->SetContentStream(CPDF_PageObject::kNoContentStream);
+   obj->SetDirty(true);
+   return true;
++}
++
++namespace {
++
++// CFX_GraphStateData's initial miter limit, which is also what a
++// regenerated stream ends up with since the generator never writes `M`.
++constexpr float kDefaultMiterLimit = 10.0f;
++
++bool IsLostOnRegen(const CPDF_Color* color) {
++  return color && !color->IsNull() && !color->IsColorSpaceRGB() &&
++         !color->IsColorSpaceGray();
++}
++
++bool TextModeFills(TextRenderingMode mode) {
++  return mode == TextRenderingMode::MODE_FILL ||
++         mode == TextRenderingMode::MODE_FILL_STROKE ||
++         mode == TextRenderingMode::MODE_FILL_CLIP ||
++         mode == TextRenderingMode::MODE_FILL_STROKE_CLIP;
++}
++
++bool TextModeStrokes(TextRenderingMode mode) {
++  return mode == TextRenderingMode::MODE_STROKE ||
++         mode == TextRenderingMode::MODE_FILL_STROKE ||
++         mode == TextRenderingMode::MODE_STROKE_CLIP ||
++         mode == TextRenderingMode::MODE_FILL_STROKE_CLIP;
++}
++
++// True when the font dictionary sits directly inside the resources and
++// carries more than the generator keeps: it rebuilds such fonts from
++// Type, Subtype, BaseFont and a named Encoding only.
++bool IsInlineFontLostOnRegen(const CPDF_Dictionary* font_dict) {
++  if (!font_dict || !font_dict->IsInline()) {
++    return false;
++  }
++  CPDF_DictionaryLocker locker(font_dict);
++  for (const auto& it : locker) {
++    const ByteString& key = it.first;
++    if (key == "Type" || key == "Subtype" || key == "BaseFont") {
++      continue;
++    }
++    if (key == "Encoding" && it.second && it.second->IsName()) {
++      continue;
++    }
++    return true;
++  }
++  return false;
++}
++
++// True when the named ExtGState sets anything the generator does not
++// write back. Line width, cap, join and dash are re-emitted as operators;
++// the miter limit is reported separately, from the parsed graph state.
++bool IsExtGStateLostOnRegen(const CPDF_Dictionary* resources,
++                            const ByteString& name) {
++  if (!resources) {
++    return false;
++  }
++  RetainPtr<const CPDF_Dictionary> states = resources->GetDictFor("ExtGState");
++  if (!states) {
++    return false;
++  }
++  RetainPtr<const CPDF_Dictionary> state = states->GetDictFor(name.AsStringView());
++  if (!state) {
++    return false;
++  }
++  CPDF_DictionaryLocker locker(state);
++  for (const auto& it : locker) {
++    const ByteString& key = it.first;
++    if (key == "Type" || key == "ca" || key == "CA" || key == "BM" ||
++        key == "LW" || key == "LC" || key == "LJ" || key == "ML" ||
++        key == "D") {
++      continue;
++    }
++    if (key == "SMask") {
++      RetainPtr<const CPDF_Object> mask = state->GetDirectObjectFor("SMask");
++      if (!mask || (mask->IsName() && mask->GetString() == "None")) {
++        continue;
++      }
++    }
++    return true;
++  }
++  return false;
++}
++
++}  // namespace
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_PageObjGetRegenLossFlags(FPDF_PAGE page,
++                                   FPDF_PAGEOBJECT page_object) {
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj) {
++    return -1;
++  }
++  if (!obj->IsActive()) {
++    return 0;
++  }
++
++  int flags = 0;
++  bool fills = false;
++  bool strokes = false;
++  switch (obj->GetType()) {
++    case CPDF_PageObject::Type::kPath: {
++      const CPDF_PathObject* path = obj->AsPath();
++      fills = !path->has_no_filltype();
++      strokes = path->stroke();
++      break;
++    }
++    case CPDF_PageObject::Type::kText: {
++      const CPDF_TextObject* text = obj->AsText();
++      const TextRenderingMode mode = text->GetTextRenderMode();
++      fills = TextModeFills(mode);
++      strokes = TextModeStrokes(mode);
++      if (text->text_state().GetCharSpace() != 0.0f ||
++          text->text_state().GetWordSpace() != 0.0f) {
++        flags |= FPDFREJEB_REGENLOSS_TEXT_SPACING;
++      }
++      RetainPtr<CPDF_Font> font = text->GetFont();
++      if (font && font->IsType3Font()) {
++        flags |= FPDFREJEB_REGENLOSS_TYPE3_TEXT;
++      }
++      if (font && IsInlineFontLostOnRegen(font->GetFontDict().Get())) {
++        flags |= FPDFREJEB_REGENLOSS_INLINE_FONT;
++      }
++      break;
++    }
++    case CPDF_PageObject::Type::kImage: {
++      RetainPtr<CPDF_Image> image = obj->AsImage()->GetImage();
++      if (!image || image->IsInline() || !image->GetStream()) {
++        flags |= FPDFREJEB_REGENLOSS_INLINE_IMAGE;
++      }
++      // Only a stencil mask paints with the current fill colour.
++      fills = image && image->IsMask();
++      break;
++    }
++    case CPDF_PageObject::Type::kForm:
++      // The form's content inherits both colours unless it sets its own.
++      fills = true;
++      strokes = true;
++      break;
++    case CPDF_PageObject::Type::kShading:
++      flags |= FPDFREJEB_REGENLOSS_SHADING;
++      break;
++  }
++
++  const CPDF_ColorState& colors = obj->color_state();
++  if (colors.HasRef()) {
++    if (fills && IsLostOnRegen(colors.GetFillColor())) {
++      flags |= FPDFREJEB_REGENLOSS_FILL_COLORSPACE;
++    }
++    if (strokes && IsLostOnRegen(colors.GetStrokeColor())) {
++      flags |= FPDFREJEB_REGENLOSS_STROKE_COLORSPACE;
++    }
++  }
++
++  if (strokes &&
++      obj->graph_state().GetLineJoin() == CFX_GraphStateData::LineJoin::kMiter &&
++      obj->graph_state().GetMiterLimit() != kDefaultMiterLimit) {
++    flags |= FPDFREJEB_REGENLOSS_MITER_LIMIT;
++  }
++
++  const CPDF_ClipPath& clip = obj->clip_path();
++  if (clip.HasRef() && clip.GetTextCount() > 0) {
++    flags |= FPDFREJEB_REGENLOSS_TEXT_CLIP;
++  }
++
++  const CPDF_GeneralState& general = obj->general_state();
++  if (general.HasRef()) {
++    if (general.GetSoftMask() || general.GetTR() ||
++        general.GetTransferFunc() || general.GetFillOP() ||
++        general.GetStrokeOP() || general.GetOPMode() != 0 ||
++        general.GetStrokeAdjust()) {
++      flags |= FPDFREJEB_REGENLOSS_GRAPHICS_STATE;
++    }
++  }
++  const CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
++  if (cpage) {
++    RetainPtr<const CPDF_Dictionary> resources = cpage->GetResources();
++    for (const ByteString& name : obj->GetGraphicsResourceNames()) {
++      if (IsExtGStateLostOnRegen(resources.Get(), name)) {
++        flags |= FPDFREJEB_REGENLOSS_GRAPHICS_STATE;
++        break;
++      }
++    }
++  }
++  return flags;
+ }
++
++FPDF_EXPORT int FPDF_CALLCONV
++FPDFRejeb_PageObjGetContentStream(FPDF_PAGEOBJECT page_object) {
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!obj) {
++    return -1;
++  }
++  const int32_t stream = obj->GetContentStream();
++  return stream < 0 ? -1 : stream;
++}

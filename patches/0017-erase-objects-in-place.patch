@@ -1,0 +1,636 @@
+# Feature patch 0017 — erase loaded objects without rewriting their stream.
+#
+#   FPDFRejeb_PageEraseObjects(page, page_objects, count)
+#       → overwrites the objects' own bytes with spaces in the original
+#         content stream data — an image's `/Name Do`, or the `q` ... `Q`
+#         pair around any other object — deactivates them and drops the
+#         resources nothing references any more. Every other byte of the
+#         page stays as it was, so nothing sharing the stream goes through
+#         CPDF_PageContentGenerator. All or nothing.
+#
+#   Upstream files change, which the additive exports cannot avoid:
+#     - CPDF_PageObject gains a SourceSpan, which CPDF_StreamContentParser
+#       fills in: where the `Do` that painted an image ends, and the
+#       innermost `q` ... `Q` pair painting the object and nothing else,
+#       with the matrix in effect when it opened. The parser is the only
+#       place that knows where an operator sits in the stream;
+#       re-tokenizing later would have to guess which occurrence produced
+#       which object.
+#     - CPDF_PageContentGenerator::UpdateResourcesDict() becomes public so
+#       unused entries can be dropped through the generator's own
+#       shared-dictionary handling instead of a copy of it.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -2,12 +2,15 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <map>
+ #include <memory>
++#include <set>
+ #include <utility>
+ #include <vector>
+ 
+ #include "public/fpdf_rejeb.h"
+ 
++#include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
+ #include "core/fpdfapi/font/cpdf_font.h"
+ #include "core/fpdfapi/font/cpdf_type3char.h"
+ #include "core/fpdfapi/font/cpdf_type3font.h"
+@@ -31,12 +34,19 @@
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
++#include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
++#include "core/fpdfapi/parser/cpdf_stream_acc.h"
++#include "core/fpdfapi/parser/fpdf_parser_utility.h"
++#include "core/fpdfapi/parser/object_tree_traversal_util.h"
+ #include "core/fpdfapi/render/cpdf_pagerendercontext.h"
+ #include "core/fpdfapi/render/cpdf_rendercontext.h"
+ #include "core/fpdfapi/render/cpdf_renderstatus.h"
+ #include "core/fpdftext/cpdf_textpage.h"
+ #include "core/fxcrt/compiler_specific.h"
++#include "core/fxcrt/data_vector.h"
++#include "core/fxcrt/span.h"
++#include "core/fxcrt/unowned_ptr.h"
+ #include "core/fxcrt/retain_ptr.h"
+ #include "core/fxge/cfx_defaultrenderdevice.h"
+ #include "core/fxge/cfx_font.h"
+@@ -844,4 +854,310 @@
+   }
+   const int32_t stream = obj->GetContentStream();
+   return stream < 0 ? -1 : stream;
++}
++
++namespace {
++
++bool PageOwnsObject(const CPDF_Page* page, const CPDF_PageObject* obj) {
++  for (const auto& candidate : *page) {
++    if (candidate.get() == obj) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Mirrors how CPDF_ContentParser numbers a page's content streams: the
++// position in the /Contents array, or 0 for a single stream.
++RetainPtr<const CPDF_Stream> GetContentStreamAt(const CPDF_Page* page,
++                                                int32_t index) {
++  RetainPtr<const CPDF_Dictionary> dict = page->GetDict();
++  if (!dict || index < 0) {
++    return nullptr;
++  }
++  RetainPtr<const CPDF_Object> contents = dict->GetDirectObjectFor("Contents");
++  if (!contents) {
++    return nullptr;
++  }
++  if (const CPDF_Stream* stream = contents->AsStream()) {
++    return index == 0 ? pdfium::WrapRetain(stream) : nullptr;
++  }
++  const CPDF_Array* array = contents->AsArray();
++  if (!array || static_cast<size_t>(index) >= array->size()) {
++    return nullptr;
++  }
++  return ToStream(array->GetDirectObjectAt(index));
++}
++
++// Whether ReplaceContentStreamData() can do its job for stream |index|.
++bool CanReplaceContentStreamData(CPDF_Page* page, int32_t index) {
++  RetainPtr<CPDF_Dictionary> page_dict = page->GetMutableDict();
++  if (!page->GetDocument() || !page_dict || index < 0) {
++    return false;
++  }
++  RetainPtr<CPDF_Object> contents =
++      page_dict->GetMutableDirectObjectFor("Contents");
++  if (!contents) {
++    return false;
++  }
++  if (contents->IsStream()) {
++    return index == 0;
++  }
++  CPDF_Array* array = contents->AsMutableArray();
++  if (!array || static_cast<size_t>(index) >= array->size()) {
++    return false;
++  }
++  RetainPtr<CPDF_Reference> reference =
++      ToReference(array->GetMutableObjectAt(static_cast<size_t>(index)));
++  return reference && ToStream(reference->GetMutableDirect());
++}
++
++// Gives content stream |index| of |page| new data. A stream or /Contents
++// array other pages reference too is left alone: the page gets its own
++// copy. CPDF_PageContentManager does the same but must not be used while
++// the page has streams waiting to be regenerated.
++bool ReplaceContentStreamData(CPDF_Page* page,
++                              int32_t index,
++                              pdfium::span<const uint8_t> data) {
++  CPDF_Document* doc = page->GetDocument();
++  RetainPtr<CPDF_Dictionary> page_dict = page->GetMutableDict();
++  if (!doc || !page_dict || index < 0) {
++    return false;
++  }
++  const std::set<uint32_t> shared = GetObjectsWithMultipleReferences(doc);
++  const auto is_shared = [&shared](const CPDF_Object* object) {
++    return object->GetObjNum() != 0 &&
++           shared.find(object->GetObjNum()) != shared.end();
++  };
++  const auto new_stream_number = [doc, data]() {
++    return doc
++        ->NewIndirect<CPDF_Stream>(DataVector<uint8_t>(data.begin(), data.end()),
++                                   doc->New<CPDF_Dictionary>())
++        ->GetObjNum();
++  };
++
++  RetainPtr<CPDF_Object> contents =
++      page_dict->GetMutableDirectObjectFor("Contents");
++  if (!contents) {
++    return false;
++  }
++  if (CPDF_Stream* stream = contents->AsMutableStream()) {
++    if (index != 0) {
++      return false;
++    }
++    if (is_shared(stream)) {
++      page_dict->SetNewFor<CPDF_Reference>("Contents", doc,
++                                           new_stream_number());
++    } else {
++      stream->SetDataAndRemoveFilter(data);
++    }
++    return true;
++  }
++
++  RetainPtr<CPDF_Array> array = pdfium::WrapRetain(contents->AsMutableArray());
++  if (!array || static_cast<size_t>(index) >= array->size()) {
++    return false;
++  }
++  if (is_shared(array.Get())) {
++    array = pdfium::WrapRetain(array->Clone()->AsMutableArray());
++    page_dict->SetFor("Contents", array);
++  }
++  RetainPtr<CPDF_Reference> reference =
++      ToReference(array->GetMutableObjectAt(static_cast<size_t>(index)));
++  RetainPtr<CPDF_Stream> stream =
++      reference ? ToStream(reference->GetMutableDirect()) : nullptr;
++  if (!stream) {
++    return false;
++  }
++  if (is_shared(stream.Get())) {
++    reference->SetRef(doc, new_stream_number());
++  } else {
++    stream->SetDataAndRemoveFilter(data);
++  }
++  return true;
++}
++
++// The decoded data of the content streams an edit touches, written back in
++// one go once every change has been made.
++class ContentStreamEdits {
++ public:
++  explicit ContentStreamEdits(CPDF_Page* page) : page_(page) {}
++
++  // Null when |stream_index| names no stream of the page.
++  DataVector<uint8_t>* DataOf(int32_t stream_index) {
++    auto it = data_.find(stream_index);
++    if (it != data_.end()) {
++      return &it->second;
++    }
++    RetainPtr<const CPDF_Stream> stream =
++        GetContentStreamAt(page_, stream_index);
++    if (!stream) {
++      return nullptr;
++    }
++    auto accessor = pdfium::MakeRetain<CPDF_StreamAcc>(std::move(stream));
++    accessor->LoadAllDataFiltered();
++    const pdfium::span<const uint8_t> decoded = accessor->GetSpan();
++    return &data_
++                .emplace(stream_index,
++                         DataVector<uint8_t>(decoded.begin(), decoded.end()))
++                .first->second;
++  }
++
++  // All or nothing: no stream is written unless every one of them can be.
++  bool Commit() {
++    for (const auto& [stream_index, data] : data_) {
++      if (!CanReplaceContentStreamData(page_, stream_index)) {
++        return false;
++      }
++    }
++    for (const auto& [stream_index, data] : data_) {
++      if (!ReplaceContentStreamData(page_, stream_index, data)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++ private:
++  UnownedPtr<CPDF_Page> const page_;
++  std::map<int32_t, DataVector<uint8_t>> data_;
++};
++
++struct ByteRange {
++  size_t begin = 0;
++  size_t end = 0;
++
++  bool empty() const { return end <= begin; }
++};
++
++bool IsTokenBreak(uint8_t ch) {
++  return PDFCharIsWhitespace(ch) || PDFCharIsDelimiter(ch);
+ }
++
++// Finds the `/Name Do` operator that ends at |operator_end|, or returns an
++// empty range when the bytes there are anything else.
++ByteRange FindPaintOperator(pdfium::span<const uint8_t> data,
++                            size_t operator_end,
++                            const ByteString& resource_name) {
++  if (operator_end == 0 || operator_end > data.size() ||
++      resource_name.IsEmpty()) {
++    return {};
++  }
++  size_t end = operator_end;
++  while (end > 0 && PDFCharIsWhitespace(data[end - 1])) {
++    --end;
++  }
++  if (end < 2 || data[end - 2] != 'D' || data[end - 1] != 'o') {
++    return {};
++  }
++  size_t cursor = end - 2;
++  if (cursor == 0 || !PDFCharIsWhitespace(data[cursor - 1])) {
++    return {};
++  }
++  while (cursor > 0 && PDFCharIsWhitespace(data[cursor - 1])) {
++    --cursor;
++  }
++  const size_t name_end = cursor;
++  while (cursor > 0 && !IsTokenBreak(data[cursor - 1])) {
++    --cursor;
++  }
++  if (cursor == 0 || data[cursor - 1] != '/' || cursor == name_end) {
++    return {};
++  }
++  const ByteString written_name(
++      ByteStringView(data.subspan(cursor, name_end - cursor)));
++  if (PDF_NameDecode(written_name.AsStringView()) != resource_name) {
++    return {};
++  }
++  return {cursor - 1, end};
++}
++
++// The `q` ... `Q` pair recorded for |obj|, or an empty range when the bytes
++// there are anything else.
++ByteRange FindGroup(pdfium::span<const uint8_t> data,
++                    const CPDF_PageObject* obj) {
++  const CPDF_PageObject::SourceSpan& span = obj->source_span();
++  if (!span.has_group() || span.group_end > data.size()) {
++    return {};
++  }
++  const size_t begin = span.group_begin;
++  const size_t end = span.group_end;
++  const bool opens = data[begin] == 'q' &&
++                     (begin == 0 || IsTokenBreak(data[begin - 1])) &&
++                     IsTokenBreak(data[begin + 1]);
++  const bool closes = data[end - 1] == 'Q' && IsTokenBreak(data[end - 2]) &&
++                      (end == data.size() || IsTokenBreak(data[end]));
++  return opens && closes ? ByteRange{begin, end} : ByteRange{};
++}
++
++bool IsEditableInPlace(const CPDF_Page* page, const CPDF_PageObject* obj) {
++  return obj && obj->IsActive() && !obj->IsDirty() &&
++         obj->GetContentStream() >= 0 && PageOwnsObject(page, obj);
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFRejeb_PageEraseObjects(FPDF_PAGE page,
++                           const FPDF_PAGEOBJECT* page_objects,
++                           int count) {
++  CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
++  if (!cpage || !page_objects || count <= 0) {
++    return false;
++  }
++
++  struct Erasure {
++    CPDF_PageObject* obj;
++    DataVector<uint8_t>* data;
++    ByteRange range;
++  };
++  ContentStreamEdits edits(cpage);
++  std::vector<Erasure> erasures;
++  // SAFETY: the caller passes |count| handles.
++  auto handles = UNSAFE_BUFFERS(
++      pdfium::span<const FPDF_PAGEOBJECT>(page_objects,
++                                          static_cast<size_t>(count)));
++  for (FPDF_PAGEOBJECT handle : handles) {
++    CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(handle);
++    if (!IsEditableInPlace(cpage, obj)) {
++      return false;
++    }
++    DataVector<uint8_t>* data = edits.DataOf(obj->GetContentStream());
++    if (!data) {
++      return false;
++    }
++    ByteRange range;
++    if (obj->AsImage()) {
++      range = FindPaintOperator(*data, obj->source_span().operator_end,
++                                obj->GetResourceName());
++    }
++    if (range.empty()) {
++      range = FindGroup(*data, obj);
++    }
++    if (range.empty()) {
++      return false;
++    }
++    erasures.push_back({obj, data, range});
++  }
++
++  // Nothing has changed up to here. Blanking keeps every length, so the
++  // positions recorded for the other objects stay valid.
++  for (const Erasure& erasure : erasures) {
++    for (size_t i = erasure.range.begin; i < erasure.range.end; ++i) {
++      (*erasure.data)[i] = ' ';
++    }
++  }
++  if (!edits.Commit()) {
++    return false;
++  }
++  for (const Erasure& erasure : erasures) {
++    // SetIsActive() flags the object dirty, which would send its stream
++    // through the generator after all.
++    erasure.obj->SetIsActive(false);
++    erasure.obj->SetDirty(false);
++  }
++
++  CPDF_PageContentGenerator generator(cpage);
++  generator.UpdateResourcesDict();
++  return true;
++}
+\ No newline at end of file
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+index b37d06b..e50b202 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+@@ -35,6 +35,10 @@ class CPDF_PageContentGenerator {
+   void GenerateContent();
+   bool ProcessPageObjects(fxcrt::ostringstream* buf);
+ 
++  // Updates the resource dictionary for `obj_holder_` to account for all the
++  // changes.
++  void UpdateResourcesDict();
++
+  private:
+   friend class CPDFPageContentGeneratorTest;
+ 
+@@ -69,10 +73,6 @@ class CPDF_PageContentGenerator {
+   // been parsed from or written to any content stream yet.
+   void UpdateStreamlessPageObjects(int new_content_stream_index);
+ 
+-  // Updates the resource dictionary for `obj_holder_` to account for all the
+-  // changes.
+-  void UpdateResourcesDict();
+-
+   UnownedPtr<CPDF_PageObjectHolder> const obj_holder_;
+   UnownedPtr<CPDF_Document> const document_;
+   std::vector<UnownedPtr<CPDF_PageObject>> page_objects_;
+diff --git a/core/fpdfapi/page/cpdf_pageobject.h b/core/fpdfapi/page/cpdf_pageobject.h
+index 5b2cb55..64a5bd3 100644
+--- a/core/fpdfapi/page/cpdf_pageobject.h
++++ b/core/fpdfapi/page/cpdf_pageobject.h
+@@ -92,6 +92,33 @@ class CPDF_PageObject {
+     content_stream_ = new_content_stream;
+   }
+ 
++  // Where the object was parsed from. Every position counts bytes from the
++  // start of the decoded content stream GetContentStream() names.
++  struct SourceSpan {
++    // Just past the operator that painted the object, 0 when unknown. Only
++    // recorded for XObjects painted with `Do`.
++    uint32_t operator_end = 0;
++    // The clip in effect at that operator, as the stream sets it up: the
++    // object's own clip path may have been dropped as redundant since.
++    // `clip_box` only bounds the clip exactly when `clip_is_rectangles`.
++    bool clipped = false;
++    bool clip_is_rectangles = false;
++    CFX_FloatRect clip_box;
++    // The innermost `q` ... `Q` pair that paints this object and nothing
++    // else, from the `q` up to just past the `Q`. Both 0 when there is none.
++    uint32_t group_begin = 0;
++    uint32_t group_end = 0;
++    // The transformation matrix in effect at `group_begin`.
++    CFX_Matrix group_ctm;
++    // How many ExtGState names applied to the object were already in effect
++    // at `group_begin`.
++    size_t group_outer_graphics_names = 0;
++
++    bool has_group() const { return group_end > group_begin; }
++  };
++  const SourceSpan& source_span() const { return source_span_; }
++  SourceSpan& mutable_source_span() { return source_span_; }
++
+   const ByteString& GetResourceName() const { return resource_name_; }
+   void SetResourceName(const ByteString& resource_name) {
+     resource_name_ = resource_name;
+@@ -160,6 +187,7 @@ class CPDF_PageObject {
+   bool matrix_dirty_ = false;
+   bool is_active_ = true;
+   int32_t content_stream_;
++  SourceSpan source_span_;
+   // The resource name for this object.
+   ByteString resource_name_;
+ };
+diff --git a/core/fpdfapi/page/cpdf_streamcontentparser.cpp b/core/fpdfapi/page/cpdf_streamcontentparser.cpp
+index 14c5b0e..309dcec 100644
+--- a/core/fpdfapi/page/cpdf_streamcontentparser.cpp
++++ b/core/fpdfapi/page/cpdf_streamcontentparser.cpp
+@@ -715,6 +715,10 @@ void CPDF_StreamContentParser::Handle_BeginMarkedContent() {
+ }
+ 
+ void CPDF_StreamContentParser::Handle_BeginText() {
++  in_text_object_ = true;
++  for (OpenGroup& group : open_groups_) {
++    ++group.open_text_objects;
++  }
+   cur_states_->set_text_matrix(CFX_Matrix());
+   OnChangeTextMatrix();
+   cur_states_->ResetTextPosition();
+@@ -780,6 +784,7 @@ void CPDF_StreamContentParser::Handle_ExecuteXObject() {
+   if (name == last_image_name_ && last_image_ && last_image_->GetStream() &&
+       last_image_->GetStream()->GetObjNum()) {
+     CPDF_ImageObject* pObj = AddLastImage();
++    RecordSourceOperatorEnd(pObj);
+     // Record the bounding box of this image, so rendering code can draw it
+     // properly.
+     if (pObj && pObj->GetImage()->IsMask()) {
+@@ -804,6 +809,7 @@ void CPDF_StreamContentParser::Handle_ExecuteXObject() {
+         pXObject->IsInline()
+             ? AddImageFromStream(ToStream(pXObject->Clone()), name)
+             : AddImageFromStreamObjNum(pXObject->GetObjNum(), name);
++    RecordSourceOperatorEnd(pObj);
+ 
+     last_image_name_ = std::move(name);
+     if (pObj) {
+@@ -914,10 +920,20 @@ void CPDF_StreamContentParser::Handle_EndMarkedContent() {
+   // the EMCs are mismatched with the BMC/BDCs.
+   if (content_marks_stack_.size() > 1) {
+     content_marks_stack_.pop();
++    for (OpenGroup& group : open_groups_) {
++      group.lowest_marks_depth =
++          std::min(group.lowest_marks_depth, content_marks_stack_.size());
++    }
+   }
+ }
+ 
+ void CPDF_StreamContentParser::Handle_EndText() {
++  in_text_object_ = false;
++  for (OpenGroup& group : open_groups_) {
++    if (--group.open_text_objects < 0) {
++      group.closed_outer_text_object = true;
++    }
++  }
+   if (clip_text_list_.empty()) {
+     return;
+   }
+@@ -1044,6 +1060,19 @@ void CPDF_StreamContentParser::Handle_EndPath() {
+ 
+ void CPDF_StreamContentParser::Handle_SaveGraphState() {
+   state_stack_.push_back(std::make_unique<CPDF_AllStates>(*cur_states_));
++
++  OpenGroup group;
++  group.stream_index = GetCurrentStreamIndex();
++  // The keyword just parsed is the single byte `q`.
++  group.begin = GetPositionInStream(group.stream_index) - 1;
++  group.object_count = object_holder_->GetPageObjectCount();
++  group.ctm = cur_states_->current_transformation_matrix();
++  group.graphics_names =
++      cur_states_->general_state().GetGraphicsResourceNames().size();
++  group.marks_depth = content_marks_stack_.size();
++  group.lowest_marks_depth = group.marks_depth;
++  group.in_text_object = in_text_object_;
++  open_groups_.push_back(group);
+ }
+ 
+ void CPDF_StreamContentParser::Handle_RestoreGraphState() {
+@@ -1051,6 +1080,10 @@ void CPDF_StreamContentParser::Handle_RestoreGraphState() {
+     return;
+   }
+ 
++  const OpenGroup group = open_groups_.back();
++  open_groups_.pop_back();
++  RecordSourceGroup(group);
++
+   *cur_states_ = *state_stack_.back();
+   state_stack_.pop_back();
+   all_ctms_[GetCurrentStreamIndex()] =
+@@ -1385,6 +1418,66 @@ int32_t CPDF_StreamContentParser::GetCurrentStreamIndex() {
+   return (it - stream_start_offsets_.begin()) - 1;
+ }
+ 
++uint32_t CPDF_StreamContentParser::GetPositionInStream(
++    int32_t stream_index) const {
++  if (stream_index < 0 ||
++      static_cast<size_t>(stream_index) >= stream_start_offsets_.size()) {
++    return 0;
++  }
++  return syntax_->GetPos() + start_parse_offset_ -
++         stream_start_offsets_[stream_index];
++}
++
++void CPDF_StreamContentParser::RecordSourceOperatorEnd(CPDF_PageObject* obj) {
++  if (!obj) {
++    return;
++  }
++  CPDF_PageObject::SourceSpan& span = obj->mutable_source_span();
++  span.operator_end = GetPositionInStream(GetCurrentStreamIndex());
++
++  const CPDF_ClipPath& clip = cur_states_->clip_path();
++  if (!clip.HasRef() || (clip.GetPathCount() == 0 && clip.GetTextCount() == 0)) {
++    return;
++  }
++  span.clipped = true;
++  span.clip_is_rectangles = clip.GetTextCount() == 0;
++  for (size_t i = 0; i < clip.GetPathCount(); ++i) {
++    span.clip_is_rectangles = span.clip_is_rectangles && clip.GetPath(i).IsRect();
++  }
++  span.clip_box = clip.GetClipBox();
++}
++
++void CPDF_StreamContentParser::RecordSourceGroup(const OpenGroup& group) {
++  if (group.stream_index < 0 ||
++      group.stream_index != GetCurrentStreamIndex() ||
++      object_holder_->GetPageObjectCount() != group.object_count + 1) {
++    return;
++  }
++  // The pair has to be a unit on every level, or taking its bytes out
++  // would leave a marked-content sequence or a text object half open.
++  const bool marks_balanced =
++      content_marks_stack_.size() == group.marks_depth &&
++      group.lowest_marks_depth == group.marks_depth;
++  const bool text_balanced = !group.in_text_object && !in_text_object_ &&
++                             group.open_text_objects == 0 &&
++                             !group.closed_outer_text_object;
++  if (!marks_balanced || !text_balanced) {
++    return;
++  }
++  CPDF_PageObject* obj =
++      object_holder_->GetPageObjectByIndex(group.object_count);
++  const uint32_t end = GetPositionInStream(group.stream_index);
++  // An enclosing pair closing later must not widen the span.
++  if (!obj || obj->source_span().has_group() || end <= group.begin) {
++    return;
++  }
++  CPDF_PageObject::SourceSpan& span = obj->mutable_source_span();
++  span.group_begin = group.begin;
++  span.group_end = end;
++  span.group_ctm = group.ctm;
++  span.group_outer_graphics_names = group.graphics_names;
++}
++
+ void CPDF_StreamContentParser::Handle_ShowText() {
+   ByteString str = GetString(0);
+   if (!str.IsEmpty()) {
+diff --git a/core/fpdfapi/page/cpdf_streamcontentparser.h b/core/fpdfapi/page/cpdf_streamcontentparser.h
+index 8aa0be5..25c35de 100644
+--- a/core/fpdfapi/page/cpdf_streamcontentparser.h
++++ b/core/fpdfapi/page/cpdf_streamcontentparser.h
+@@ -135,6 +135,26 @@ class CPDF_StreamContentParser {
+   std::vector<float> GetNamedColors() const;
+   int32_t GetCurrentStreamIndex();
+ 
++  // A `q` still waiting for its `Q`.
++  struct OpenGroup {
++    int32_t stream_index = -1;
++    uint32_t begin = 0;
++    size_t object_count = 0;
++    CFX_Matrix ctm;
++    size_t graphics_names = 0;
++    // Marked-content nesting at the `q`, and the shallowest it got since.
++    size_t marks_depth = 0;
++    size_t lowest_marks_depth = 0;
++    // Whether the `q` sits inside a text object, and how many text objects
++    // opened since are still open; negative once one from before closed.
++    bool in_text_object = false;
++    int open_text_objects = 0;
++    bool closed_outer_text_object = false;
++  };
++  uint32_t GetPositionInStream(int32_t stream_index) const;
++  void RecordSourceOperatorEnd(CPDF_PageObject* obj);
++  void RecordSourceGroup(const OpenGroup& group);
++
+   void Handle_CloseFillStrokePath();
+   void Handle_FillStrokePath();
+   void Handle_CloseEOFillStrokePath();
+@@ -231,6 +251,9 @@ class CPDF_StreamContentParser {
+   RetainPtr<CPDF_Image> last_image_;
+   bool colored_ = false;
+   std::vector<std::unique_ptr<CPDF_AllStates>> state_stack_;
++  // One entry per entry of `state_stack_`.
++  std::vector<OpenGroup> open_groups_;
++  bool in_text_object_ = false;
+   std::array<float, 6> type3_data_ = {};
+   std::array<ContentParam, kParamBufSize> param_buf_;
+   CPDF_PageObjectHolder::CTMMap all_ctms_;

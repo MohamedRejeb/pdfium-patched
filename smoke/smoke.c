@@ -76,6 +76,9 @@ int main(void) {
     (void)FPDFRejeb_PageMoveObjectStreamToFront(NULL, NULL);
     (void)FPDFRejeb_PageObjTransformInPlace(NULL, NULL, NULL);
   }
+  {
+    (void)FPDFRejeb_PageObjGetRenderedBitmapOnPage(NULL, NULL, 1.0f, NULL);
+  }
 
   FPDF_DestroyLibrary();
   printf("OK\n");

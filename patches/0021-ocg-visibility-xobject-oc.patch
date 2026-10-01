@@ -1,0 +1,56 @@
+# Fix patch 0021 — FPDFRejeb_OCContextCheckObjectVisible sees a layer named
+# by the XObject itself.
+#
+#   A Form or Image XObject can name its Optional Content layer with /OC in
+#   its own dictionary instead of being wrapped in /OC marked content. The
+#   renderer honours both: marked content through
+#   CPDF_OCContext::CheckPageObjectVisible(), the XObject's own entry in
+#   CPDF_RenderStatus::ProcessForm() and CPDF_ImageRenderer::Start().
+#
+#   The export only made the first check, so it reported such an object as
+#   visible while a render of the page left it out — a watermark form whose
+#   layer is off for viewing (/Usage /View /ViewState /OFF applied through
+#   /OCProperties /D /AS) is the common case.
+#
+#   It now also runs CheckOCGDictVisible() on the form's or the image's /OC
+#   dictionary (an OCG or an OCMD), like the renderer. No signature change.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -23,6 +23,7 @@
+ #include "core/fpdfapi/page/cpdf_color.h"
+ #include "core/fpdfapi/page/cpdf_colorstate.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
++#include "core/fpdfapi/page/cpdf_formobject.h"
+ #include "core/fpdfapi/page/cpdf_generalstate.h"
+ #include "core/fpdfapi/page/cpdf_image.h"
+ #include "core/fpdfapi/page/cpdf_imageobject.h"
+@@ -116,7 +117,26 @@
+   if (!page_obj) {
+     return false;
+   }
+-  return (*boxed)->CheckPageObjectVisible(page_obj);
++  if (!(*boxed)->CheckPageObjectVisible(page_obj)) {
++    return false;
++  }
++  // A Form or Image XObject can also name its layer with /OC in its own
++  // dictionary. CheckPageObjectVisible() only reads marked content; the
++  // renderer checks these in CPDF_RenderStatus::ProcessForm() and
++  // CPDF_ImageRenderer::Start().
++  RetainPtr<const CPDF_Dictionary> oc;
++  if (const CPDF_FormObject* form_obj = page_obj->AsForm()) {
++    RetainPtr<const CPDF_Dictionary> form_dict = form_obj->form()->GetDict();
++    if (form_dict) {
++      oc = form_dict->GetDictFor("OC");
++    }
++  } else if (const CPDF_ImageObject* image_obj = page_obj->AsImage()) {
++    RetainPtr<CPDF_Image> image = image_obj->GetImage();
++    if (image) {
++      oc = image->GetOC();
++    }
++  }
++  return (*boxed)->CheckOCGDictVisible(oc.Get());
+ }
+ 
+ namespace {

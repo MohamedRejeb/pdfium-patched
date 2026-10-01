@@ -66,7 +66,9 @@ FPDFRejeb_OCContextDestroy(FPDF_OCCONTEXT context);
 
 // Returns true if |page_object| is currently visible under the OC layer
 // state captured by |context|. Returns false on null args or when the
-// object is hidden by the active layer state.
+// object is hidden by the active layer state — through the marked content
+// around it or, for a Form or Image XObject, through /OC in the XObject's
+// own dictionary (patches/0021-ocg-visibility-xobject-oc.patch).
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 FPDFRejeb_OCContextCheckObjectVisible(FPDF_OCCONTEXT context,
                                       FPDF_PAGEOBJECT page_object);
@@ -518,6 +520,33 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 FPDFRejeb_PageObjTransformInPlace(FPDF_PAGE page,
                                   FPDF_PAGEOBJECT page_object,
                                   const FS_MATRIX* matrix);
+
+// Renders |page_object| alone, where and how it paints on |page|: placed
+// by the matrix of every Form XObject around it, and clipped by its own
+// clip path, by the clip path of each of those forms and by the page.
+// The object may sit at any depth inside forms, and may be of any type —
+// including a shading painted by the `sh` operator, which has no other
+// accessor.
+//
+// |out_rect| receives the part of the page the bitmap covers, in page
+// user space: what can show of the object, grown to whole points counted
+// from the page's top-left corner. The bitmap is that rect at |scale|
+// pixels per point, BGRA, transparent where the object paints nothing.
+// Caller owns it — release with FPDFBitmap_Destroy().
+//
+// Of the forms around the object, matrix, clip and group opacity are
+// applied; their soft mask and blend mode are not.
+//
+// Returns NULL, leaving |out_rect| alone, on null arguments, scale <= 0,
+// an object that is not on |page|, nothing of the object showing, or
+// bitmap allocation failure.
+//
+// Backed by patches/0022-export-pageobj-rendered-bitmap-on-page.patch.
+FPDF_EXPORT FPDF_BITMAP FPDF_CALLCONV
+FPDFRejeb_PageObjGetRenderedBitmapOnPage(FPDF_PAGE page,
+                                         FPDF_PAGEOBJECT page_object,
+                                         float scale,
+                                         FS_RECTF* out_rect);
 
 #ifdef __cplusplus
 }  // extern "C"

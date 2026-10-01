@@ -1,0 +1,182 @@
+# Feature patch 0022 — one object rendered as the page shows it.
+#
+#   FPDFRejeb_PageObjGetRenderedBitmapOnPage(page, page_object, scale,
+#                                            out_rect)
+#       → FPDF_BITMAP of |page_object| alone, placed by the matrix of every
+#         form around it and clipped by its own clip path, by the clip path
+#         of each of those forms and by the page. |out_rect| receives the
+#         page user-space rect the bitmap covers. Caller owns the bitmap.
+#
+#   The object is looked up in the page's object tree, so it may sit at any
+#   depth inside Form XObjects, and it may be of any type. That makes it
+#   the only way to get at a shading painted by the `sh` operator
+#   (CPDF_ShadingObject): it has no path and no colour to read, it fills
+#   whatever the clip in effect leaves open — usually the clip set on the
+#   page before the `Do` of a form whose whole content is `/Sh sh`, which
+#   is how LaTeX-made documents paint box interiors.
+#
+#   FPDFRejeb_PathObjGetRenderedBitmap() (patch 0009) only takes paths, and
+#   renders an object nested in a form in the form's space with none of the
+#   clips around it.
+#
+#   The clips of the enclosing forms go on the device through
+#   CPDF_RenderStatus::ProcessClipPath(), each followed by SaveState():
+#   RenderSingleObject() restores the device to its last saved state before
+#   it applies the object's own clip, so that state has to hold them.
+#
+#   The opacity of an enclosing form that is a transparency group is
+#   multiplied into the bitmap, as ProcessTransparency() does for the group;
+#   the content of a form that is not a group already carries the opacity
+#   itself. Soft mask and blend mode of the enclosing forms are not applied.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -53,6 +53,7 @@
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/data_vector.h"
+ #include "core/fxcrt/fx_coordinates.h"
++#include "core/fxcrt/fx_safe_types.h"
+ #include "core/fxcrt/fx_string_wrappers.h"
+ #include "core/fxcrt/span.h"
+ #include "core/fxcrt/unowned_ptr.h"
+@@ -1475,4 +1476,139 @@
+   obj->SetDirty(false);
+   obj->SetMatrixDirty(false);
+   return true;
++}
++
++// ============================================================================
++// Patch 0022 — one object rendered as the page shows it.
++
++namespace {
++
++// Appends to |forms| the form objects enclosing |target| in |holder|,
++// outermost first. Returns false, leaving |forms| as it was, when |target|
++// is not in |holder| at any depth.
++bool FindEnclosingForms(const CPDF_PageObjectHolder* holder,
++                        const CPDF_PageObject* target,
++                        std::vector<const CPDF_FormObject*>* forms) {
++  for (const auto& obj : *holder) {
++    if (obj.get() == target) {
++      return true;
++    }
++    const CPDF_FormObject* form_obj = obj ? obj->AsForm() : nullptr;
++    if (!form_obj) {
++      continue;
++    }
++    forms->push_back(form_obj);
++    if (FindEnclosingForms(form_obj->form(), target, forms)) {
++      return true;
++    }
++    forms->pop_back();
++  }
++  return false;
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_BITMAP FPDF_CALLCONV
++FPDFRejeb_PageObjGetRenderedBitmapOnPage(FPDF_PAGE page,
++                                         FPDF_PAGEOBJECT page_object,
++                                         float scale,
++                                         FS_RECTF* out_rect) {
++  CPDF_Page* cpage = CPDFPageFromFPDFPage(page);
++  CPDF_PageObject* obj = CPDFPageObjectFromFPDFPageObject(page_object);
++  if (!cpage || !obj || !out_rect || !(scale > 0)) {
++    return nullptr;
++  }
++  std::vector<const CPDF_FormObject*> forms;
++  if (!FindEnclosingForms(cpage, obj, &forms)) {
++    return nullptr;
++  }
++
++  // What of the object can show: its box cut down by its clip, by the clip
++  // of every form around it and by the page.
++  const CFX_FloatRect page_box = cpage->GetBBox();
++  CFX_FloatRect visible = page_box;
++  CFX_Matrix to_page;
++  // A form that is a transparency group applies its opacity to the group
++  // as a whole; the content of any other form inherits it object by object
++  // (CPDF_ContentParser, CPDF_RenderStatus::ProcessTransparency()).
++  float group_alpha = 1.0f;
++  for (const CPDF_FormObject* form_obj : forms) {
++    if (form_obj->clip_path().HasRef()) {
++      visible.Intersect(
++          to_page.TransformRect(form_obj->clip_path().GetClipBox()));
++    }
++    if (form_obj->form()->GetTransparency().IsGroup()) {
++      group_alpha *= form_obj->general_state().GetFillAlpha();
++    }
++    to_page = form_obj->form_matrix() * to_page;
++  }
++  if (obj->clip_path().HasRef()) {
++    visible.Intersect(to_page.TransformRect(obj->clip_path().GetClipBox()));
++  }
++  visible.Intersect(to_page.TransformRect(obj->GetRect()));
++  if (visible.IsEmpty()) {
++    return nullptr;
++  }
++
++  // Grown to whole points counted from the page's top-left corner, so at a
++  // whole |scale| the pixels fall on those of a render of the page.
++  const CFX_FloatRect rect(
++      page_box.left + floorf(visible.left - page_box.left),
++      page_box.top - ceilf(page_box.top - visible.bottom),
++      page_box.left + ceilf(visible.right - page_box.left),
++      page_box.top - floorf(page_box.top - visible.top));
++  const FX_SAFE_INT32 safe_width = roundf(rect.Width() * scale);
++  const FX_SAFE_INT32 safe_height = roundf(rect.Height() * scale);
++  if (!safe_width.IsValid() || !safe_height.IsValid()) {
++    return nullptr;
++  }
++  const int width = std::max<int>(safe_width.ValueOrDie(), 1);
++  const int height = std::max<int>(safe_height.ValueOrDie(), 1);
++
++  auto bitmap = pdfium::MakeRetain<CFX_DIBitmap>();
++  if (!bitmap->Create(width, height, FXDIB_Format::kBgra)) {
++    return nullptr;
++  }
++
++  // Same render-context plumbing as FPDFRejeb_PathObjGetRenderedBitmap().
++  auto owned_context = std::make_unique<CPDF_PageRenderContext>();
++  CPDF_PageRenderContext* context = owned_context.get();
++  CPDF_Page::RenderContextClearer clearer(cpage);
++  cpage->SetRenderContext(std::move(owned_context));
++
++  auto owned_device = std::make_unique<CFX_DefaultRenderDevice>();
++  CFX_DefaultRenderDevice* device = owned_device.get();
++  context->device_ = std::move(owned_device);
++  context->context_ = std::make_unique<CPDF_RenderContext>(
++      cpage->GetDocument(), cpage->GetMutablePageResources(),
++      cpage->GetPageImageCache());
++  device->Attach(bitmap);
++
++  CPDF_RenderStatus status(context->context_.get(), device);
++  status.SetDeviceMatrix(CFX_Matrix(width, 0, 0, height, 0, 0));
++  status.Initialize(nullptr, nullptr);
++
++  const float scale_x = width / rect.Width();
++  const float scale_y = height / rect.Height();
++  CFX_Matrix to_device(scale_x, 0, 0, -scale_y, -rect.left * scale_x,
++                       rect.top * scale_y);
++  for (const CPDF_FormObject* form_obj : forms) {
++    // RenderSingleObject() resets the device to its last saved state before
++    // it sets the object's own clip, so each form's clip is saved on top of
++    // those of the forms around it.
++    status.ProcessClipPath(form_obj->clip_path(), to_device);
++    device->SaveState();
++    to_device = form_obj->form_matrix() * to_device;
++  }
++  status.RenderSingleObject(obj, to_device);
++  bitmap->MultiplyAlpha(std::clamp(group_alpha, 0.0f, 1.0f));
++
++  ValidateBitmapPremultiplyState(bitmap);
++
++  out_rect->left = rect.left;
++  out_rect->top = rect.top;
++  out_rect->right = rect.right;
++  out_rect->bottom = rect.bottom;
++  // Caller takes ownership.
++  return FPDFBitmapFromCFXDIBitmap(bitmap.Leak());
+ }

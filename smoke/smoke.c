@@ -78,6 +78,9 @@ int main(void) {
   }
   {
     (void)FPDFRejeb_PageObjGetRenderedBitmapOnPage(NULL, NULL, 1.0f, NULL);
+    (void)FPDFRejeb_ImageCopierCreate(NULL, NULL);
+    (void)FPDFRejeb_ImageCopierCopy(NULL, NULL);
+    FPDFRejeb_ImageCopierClose(NULL);
   }
 
   FPDF_DestroyLibrary();

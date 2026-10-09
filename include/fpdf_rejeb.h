@@ -548,6 +548,48 @@ FPDFRejeb_PageObjGetRenderedBitmapOnPage(FPDF_PAGE page,
                                          float scale,
                                          FS_RECTF* out_rect);
 
+// Copies image objects from one open document into another.
+typedef struct fpdf_rejeb_image_copier_t__* FPDF_REJEB_IMAGE_COPIER;
+
+// Experimental API.
+// Creates a copier of image objects from |source_document| into
+// |dest_document|. Both documents must stay open until the copier is
+// closed with FPDFRejeb_ImageCopierClose().
+//
+// Returns NULL on null arguments or when both are the same document.
+//
+// Backed by patches/0024-export-image-copy-to-document.patch.
+FPDF_EXPORT FPDF_REJEB_IMAGE_COPIER FPDF_CALLCONV
+FPDFRejeb_ImageCopierCreate(FPDF_DOCUMENT dest_document,
+                            FPDF_DOCUMENT source_document);
+
+// Experimental API.
+// Copies the image object |source_image|, loaded from the copier's source
+// document, for its destination: the image XObject and everything it
+// references (soft mask, colour space, ICC profile, ...) are copied byte
+// for byte, so a JPEG stays a JPEG, and data the copier copied before is
+// shared rather than copied again. The copy has the source's matrix and
+// clip path, unless that clip holds text; graphics state such as alpha or
+// blend mode is not carried over.
+//
+// The caller owns the returned object until it is inserted with
+// FPDFPage_InsertObject().
+//
+// Returns NULL on null arguments, a source that is not an image, an inline
+// image, an image of another document, or a failed copy.
+//
+// Backed by patches/0024-export-image-copy-to-document.patch.
+FPDF_EXPORT FPDF_PAGEOBJECT FPDF_CALLCONV
+FPDFRejeb_ImageCopierCopy(FPDF_REJEB_IMAGE_COPIER copier,
+                          FPDF_PAGEOBJECT source_image);
+
+// Experimental API.
+// Releases |copier|. The objects it copied stay valid.
+//
+// Backed by patches/0024-export-image-copy-to-document.patch.
+FPDF_EXPORT void FPDF_CALLCONV
+FPDFRejeb_ImageCopierClose(FPDF_REJEB_IMAGE_COPIER copier);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

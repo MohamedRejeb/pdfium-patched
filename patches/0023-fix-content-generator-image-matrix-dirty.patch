@@ -1,0 +1,28 @@
+# Fix patch 0023 — a written image no longer stays modified.
+#
+#   FPDFPageObj_SetMatrix() marks an image object's matrix as changed
+#   whenever it differs from the matrix the object was loaded with — for an
+#   image created with FPDFPageObj_NewImageObj() that is always. Generating
+#   content cleared the object's dirty flag but not that one, so the image
+#   kept counting as modified after FPDFPage_GenerateContent() had written
+#   it: FPDFRejeb_PageMoveObjectStreamToFront() (patch 0018) then refused to
+#   move any page holding a new image, and later generations kept rewriting
+#   its stream.
+#
+#   The generator now clears both flags once it has written the object.
+#
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -730,6 +730,11 @@
+     ProcessText(buf, pTextObj);
+   }
+   pPageObj->SetDirty(false);
++  // The stream now holds the current matrix too. Left set, the flag kept a
++  // freshly written image dirty for good: FPDFPageObj_SetMatrix() marks it
++  // whenever the matrix differs from the original one, which for a new
++  // image is always.
++  pPageObj->SetMatrixDirty(false);
+ }
+ 
+ void CPDF_PageContentGenerator::ProcessImage(fxcrt::ostringstream* buf,

@@ -1,0 +1,127 @@
+# Feature patch 0024 — copy image objects into another document.
+#
+#   FPDFRejeb_ImageCopierCreate(dest_document, source_document)
+#   FPDFRejeb_ImageCopierCopy(copier, source_image) → FPDF_PAGEOBJECT
+#   FPDFRejeb_ImageCopierClose(copier)
+#
+#   Copies a loaded image object of one document for another: the image
+#   XObject and everything it references (soft mask, colour space, ICC
+#   profile, ...) are deep-copied the way page import copies them, so the
+#   encoded data stays as it was — a JPEG stays a JPEG. A copier remembers
+#   what it copied: an image several source pages share is copied once and
+#   stays shared. The copy keeps the source's matrix and its clip path,
+#   unless that clip holds text (its fonts belong to the source document).
+#
+#   Without it the only way to move an image between documents is to
+#   decode it and build a new one with FPDFImageObj_SetBitmap(), which
+#   stores raw pixels: Annodoc's undo of a removed page background grew a
+#   handout from 11 MB to 55 MB that way.
+#
+diff --git a/fpdfsdk/fpdf_rejeb.cpp b/fpdfsdk/fpdf_rejeb.cpp
+--- a/fpdfsdk/fpdf_rejeb.cpp
++++ b/fpdfsdk/fpdf_rejeb.cpp
+@@ -17,11 +17,13 @@
+ #include "core/fpdfapi/edit/cpdf_contentstream_write_utils.h"
+ #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
+ #include "core/fpdfapi/edit/cpdf_pagecontentmanager.h"
++#include "core/fpdfapi/edit/cpdf_pageorganizer.h"
+ #include "core/fpdfapi/font/cpdf_font.h"
+ #include "core/fpdfapi/font/cpdf_type3char.h"
+ #include "core/fpdfapi/font/cpdf_type3font.h"
+ #include "core/fpdfapi/page/cpdf_color.h"
+ #include "core/fpdfapi/page/cpdf_colorstate.h"
++#include "core/fpdfapi/page/cpdf_docpagedata.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
+ #include "core/fpdfapi/page/cpdf_formobject.h"
+ #include "core/fpdfapi/page/cpdf_generalstate.h"
+@@ -1612,3 +1614,90 @@
+   // Caller takes ownership.
+   return FPDFBitmapFromCFXDIBitmap(bitmap.Leak());
+ }
++
++// ============================================================================
++// Patch 0024 — copy image objects into another document.
++// ============================================================================
++
++namespace {
++
++// Deep-copies indirect objects of one document into another, the way page
++// import does, remembering what it copied so shared data is copied once.
++// Init() is deliberately not called: it only prepares the destination's
++// page tree (and stamps its /Producer), which images do not need.
++class ImageCopier final : public CPDF_PageOrganizer {
++ public:
++  ImageCopier(CPDF_Document* dest_doc, CPDF_Document* src_doc)
++      : CPDF_PageOrganizer(dest_doc, src_doc) {}
++
++  // A new image object for the destination painting what |source| paints.
++  std::unique_ptr<CPDF_ImageObject> Copy(const CPDF_ImageObject* source) {
++    RetainPtr<CPDF_Image> source_xobject = source->GetImage();
++    if (!source_xobject || source_xobject->IsInline() ||
++        source_xobject->GetDocument() != src()) {
++      return nullptr;
++    }
++    RetainPtr<const CPDF_Stream> stream = source_xobject->GetStream();
++    if (!stream || stream->GetObjNum() == 0) {
++      return nullptr;
++    }
++    auto reference =
++        pdfium::MakeRetain<CPDF_Reference>(src(), stream->GetObjNum());
++    if (!UpdateReference(reference)) {
++      return nullptr;
++    }
++    RetainPtr<CPDF_Image> copy_xobject =
++        CPDF_DocPageData::FromDocument(dest())->GetImage(
++            reference->GetRefObjNum());
++    if (!copy_xobject) {
++      return nullptr;
++    }
++
++    auto copy = std::make_unique<CPDF_ImageObject>();
++    copy->SetImage(std::move(copy_xobject));
++    copy->SetInitialImageMatrix(source->matrix());
++    // A text clip would keep fonts of the source document.
++    if (source->clip_path().HasRef() &&
++        source->clip_path().GetTextCount() == 0) {
++      copy->mutable_clip_path() = source->clip_path();
++    }
++    copy->SetDirty(true);
++    return copy;
++  }
++};
++
++ImageCopier* ImageCopierFromHandle(FPDF_REJEB_IMAGE_COPIER copier) {
++  return reinterpret_cast<ImageCopier*>(copier);
++}
++
++}  // namespace
++
++FPDF_EXPORT FPDF_REJEB_IMAGE_COPIER FPDF_CALLCONV
++FPDFRejeb_ImageCopierCreate(FPDF_DOCUMENT dest_document,
++                            FPDF_DOCUMENT source_document) {
++  CPDF_Document* dest_doc = CPDFDocumentFromFPDFDocument(dest_document);
++  CPDF_Document* src_doc = CPDFDocumentFromFPDFDocument(source_document);
++  if (!dest_doc || !src_doc || dest_doc == src_doc) {
++    return nullptr;
++  }
++  return reinterpret_cast<FPDF_REJEB_IMAGE_COPIER>(
++      new ImageCopier(dest_doc, src_doc));
++}
++
++FPDF_EXPORT FPDF_PAGEOBJECT FPDF_CALLCONV
++FPDFRejeb_ImageCopierCopy(FPDF_REJEB_IMAGE_COPIER copier,
++                          FPDF_PAGEOBJECT source_image) {
++  ImageCopier* image_copier = ImageCopierFromHandle(copier);
++  CPDF_PageObject* source = CPDFPageObjectFromFPDFPageObject(source_image);
++  if (!image_copier || !source || !source->AsImage()) {
++    return nullptr;
++  }
++  // Caller takes ownership.
++  return FPDFPageObjectFromCPDFPageObject(
++      image_copier->Copy(source->AsImage()).release());
++}
++
++FPDF_EXPORT void FPDF_CALLCONV
++FPDFRejeb_ImageCopierClose(FPDF_REJEB_IMAGE_COPIER copier) {
++  delete ImageCopierFromHandle(copier);
++}

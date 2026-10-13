@@ -2,6 +2,7 @@
 # Aligned with bblanchon/pdfium-binaries' verified-working args for chromium/7811.
 
 clang_use_chrome_plugins = false
+ios_deployment_target = "16.0"
 ios_enable_code_signing = false
 is_component_build = false
 is_debug = false

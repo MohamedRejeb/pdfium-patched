@@ -1,0 +1,31 @@
+# Fix patch 0025 — writing a page no longer crashes when its resources lack
+# a type that content inside a form uses.
+#
+#   After writing a page, CPDF_PageContentGenerator goes through the Font,
+#   XObject and ExtGState dictionaries of the page's resources to drop what
+#   no content names. For a type the page's dictionary lacks, it still read
+#   the keys of that missing dictionary as soon as some content used the
+#   type, and crashed on the null pointer. Since patch 0019 counts what the
+#   content of forms uses, that is common: a page whose text sits in a form
+#   with its own fonts has no /Font of its own, so drawing anything on it
+#   and calling FPDFPage_GenerateContent() brought the process down.
+#
+#   A missing dictionary now has no keys: nothing is removed, and it is
+#   created as before when used names have to be restored into it.
+#
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -251,7 +251,11 @@
+       continue;
+     }
+ 
+-    const std::vector<ByteString> keys = current_resource_dict->GetKeys();
++    // The page may lack a type that only content in a form uses: there is
++    // nothing to remove then, and the dictionary is created below if needed.
++    const std::vector<ByteString> keys =
++        current_resource_dict ? current_resource_dict->GetKeys()
++                              : std::vector<ByteString>();
+     CPDF_PageObjectHolder::RemovedResourceMap removed_resource_map =
+         RemoveUnusedResources(current_resource_dict, keys,
+                               resource_in_use_of_current_type);
